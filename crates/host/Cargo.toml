@@ -3,3 +3,10 @@ name = "host"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+
+# The host needs tonic for networking and tokio for running the compiler process asynchronously.
+[dependencies]
+common = { path = "../common" }
+tonic = "0.12"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1.0", features = ["v4"] } # To give every job a unique folder

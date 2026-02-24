@@ -15,7 +15,7 @@ This defines the interface of our Remote Procedure Call (RPC).
 
 This represents the payload sent from your local machine to the remote GPU server.
 
-1. **`source_code`**: The raw string content of the `.cu` file.
+1. **`source_code`**: The UTF-8 encoded CUDA source code, the raw string content of the `.cu` file.
 2. **`file_name`**: Allows the Host to save the file with the correct name (e.g., `vector_add.cu`) so that error messages from the compiler point to the correct filename.
 3. **`compiler_flags`**: A list of strings (e.g., `["-O3", "-arch=sm_80"]`). This gives the user control over the `nvcc` compilation process from their local CLI.
 
