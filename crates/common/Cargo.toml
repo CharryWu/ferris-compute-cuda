@@ -1,0 +1,12 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tonic = "0.12"      # The gRPC framework
+prost = "0.13"      # Protocol Buffers support
+tokio = { version = "1", features = ["full"] }
+
+[build-dependencies]
+tonic-build = "0.12" # Compiles .proto files into Rust code

@@ -1,0 +1,74 @@
+# --- Rust / Cargo ---
+# Standard Rust build artifacts
+/target/
+# Backup files created by cargo fix
+**/*.rs.bk
+
+# --- macOS & Windows Specifics (Client) ---
+# OS-specific metadata files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Windows / MSVC Specifics (Host) ---
+# Executables and libraries
+
+*.exe
+*.dll
+# Debug symbols and incremental linking data
+*.pdb
+*.ilk
+*.exp
+# Object files
+*.o
+*.obj
+# Visual Studio IDE metadata and cache
+*.sln
+*.vcxproj
+*.filters
+*.user
+.vs/
+
+# --- Linux Specifics (Host) ---
+# Shared objects and executables
+*.so
+*.app
+*.out
+# macOS/Linux dynamic libraries
+*.dylib
+
+# --- CUDA / NVCC (Cross-Platform) ---
+# Parallel Thread Execution (Intermediate GPU assembly)
+*.ptx
+# CUDA Binary and Multi-architecture Fat Binary
+*.cubin
+*.fatbin
+# Optimization and compilation hashes
+*.opt
+*.hash
+# NVCC intermediate C++ and header files
+tmpxft*
+*.compute_*.cpp
+*.compute_*.h
+*.cuda_fe_*.cpp
+*.cuda_fe_*.h
+
+# --- Protobuf / gRPC ---
+# If you generate code into a specific directory instead of OUT_DIR
+# Generated code is usually kept out of source control
+/crates/common/src/generated/
+
+# --- ferris-compute-cuda Internal Scratchpads ---
+# Local environment variables and secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Folders where the host builds user-submitted code
+/crates/host/scratch/
+/crates/host/build_artifacts/
+
+# --- IDEs ---
+.vscode/
+.idea/

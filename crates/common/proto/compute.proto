@@ -1,0 +1,18 @@
+syntax = "proto3";
+package compute;
+
+service CUDAExecutor {
+    // Client sends code, Host streams back compilation/execution logs
+    rpc ExecuteCode (ComputeRequest) returns (stream ComputeResponse);
+}
+
+message ComputeRequest {
+    string source_code = 1;
+    string file_name = 2;
+    repeated string compiler_flags = 3;
+}
+
+message ComputeResponse {
+    string output = 1;      // Could be stdout, stderr, or status updates
+    bool is_error = 2;
+}

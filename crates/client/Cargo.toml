@@ -1,0 +1,5 @@
+[package]
+name = "client" # Use a literal string here
+version.workspace = true
+edition.workspace = true
+authors.workspace = true

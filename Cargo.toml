@@ -1,0 +1,16 @@
+[workspace]
+# Tells Cargo where the actual code lives
+members = [
+    "crates/client",
+    "crates/host",
+    "crates/common",
+]
+# Crucial for keeping macOS and Windows/Linux dependencies separate
+resolver = "2"
+
+[workspace.package]
+name = "ferris-compute-cuda"
+version = "0.1.0"
+edition = "2024"
+authors = ["Your Name"]
+description = "A remote CUDA execution engine written in Rust"
