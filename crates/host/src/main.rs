@@ -1,12 +1,11 @@
-/// This is a simplified MVP version. It handles the "Happy Path" of receiving code and calling the compiler.
 use common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer};
 use common::compute::{ComputeRequest, ComputeResponse};
-use tonic::{transport::Server, Request, Response, Status};
+use std::path::Path;
+use tokio::fs;
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use std::process::Stdio;
-use tokio::process::Command;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tonic::{transport::Server, Request, Response, Status};
 
 pub struct HostExecutor;
 
@@ -22,36 +21,75 @@ impl CudaExecutor for HostExecutor {
         let (tx, rx) = mpsc::channel(100);
 
         tokio::spawn(async move {
-            // 1. Create a workspace (In a real project, use a temp dir)
             let job_id = uuid::Uuid::new_v4().to_string();
-            let file_path = format!("{}.cu", job_id);
-            let bin_path = format!("{}.out", job_id);
+            let working_dir = Path::new("scratch").join(&job_id);
 
-            std::fs::write(&file_path, &req.source_code).unwrap();
-
-            // 2. Prepare NVCC command
-            let mut child = Command::new("nvcc")
-                .arg(&file_path)
-                .arg("-o")
-                .arg(&bin_path)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("failed to spawn nvcc");
-
-            // 3. Stream NVCC output back to Client
-            let stderr = child.stderr.take().unwrap();
-            let mut reader = BufReader::new(stderr).lines();
-
-            while let Ok(Some(line)) = reader.next_line().await {
-                let _ = tx.send(Ok(ComputeResponse {
-                    output: line,
-                    is_error: true,
-                })).await;
+            // 1. Create temporary workspace
+            if let Err(e) = fs::create_dir_all(&working_dir).await {
+                let _ = tx.send(Err(Status::internal(format!("Failed to create workspace: {}", e)))).await;
+                return;
             }
 
-            // 4. (Simplified) Execute the binary and cleanup here...
-            let _ = child.wait().await;
+            let file_path = working_dir.join(&req.file_name);
+            // Platform agnostic binary extension
+            let bin_name = if cfg!(windows) { "app.exe" } else { "app.out" };
+            let bin_path = working_dir.join(bin_name);
+
+            // 2. Write source code
+            let _ = fs::write(&file_path, &req.source_code).await;
+
+            // 3. Compile with NVCC
+            let compile_status = Command::new("nvcc")
+                .arg(&file_path)
+                .args(&req.compiler_flags)
+                .arg("-o")
+                .arg(&bin_path)
+                .current_dir(&working_dir)
+                .status()
+                .await;
+
+            match compile_status {
+                Ok(s) if s.success() => {
+                    let _ = tx.send(Ok(ComputeResponse { 
+                        output: "🚀 Compilation successful. Running...".into(), 
+                        is_error: false 
+                    })).await;
+                    
+                    // 4. Execute the binary
+                    let output = Command::new(&bin_path)
+                        .current_dir(&working_dir)
+                        .output()
+                        .await;
+
+                    if let Ok(out) = output {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        
+                        if !stdout.is_empty() {
+                            let _ = tx.send(Ok(ComputeResponse { 
+                                output: stdout.to_string(), 
+                                is_error: false 
+                            })).await;
+                        }
+                        if !stderr.is_empty() {
+                            let _ = tx.send(Ok(ComputeResponse { 
+                                output: stderr.to_string(), 
+                                is_error: true 
+                            })).await;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = tx.send(Ok(ComputeResponse { 
+                        output: "❌ Compilation failed.".into(), 
+                        is_error: true 
+                    })).await;
+                }
+            }
+
+            // 5. Cleanup: Delete the entire job directory
+            let _ = fs::remove_dir_all(&working_dir).await;
+            println!("🧹 Cleaned up job {}", job_id);
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -63,8 +101,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = "[::1]:50051".parse()?;
     let executor = HostExecutor;
 
-    println!("Ferris-Compute-Cuda Host listening on {}", addr);
+    // Ensure the base scratch directory exists before we start accepting jobs
+    fs::create_dir_all("scratch").await?;
 
+    println!("🦀 Ferris-Compute-Cuda Host listening on {}", addr);
+
+    // Start the gRPC server
     Server::builder()
         .add_service(CudaExecutorServer::new(executor))
         .serve(addr)
