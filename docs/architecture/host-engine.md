@@ -368,6 +368,91 @@ This uses the **builder pattern** to configure and start the tonic gRPC server:
 
 ---
 
+## Async `.await` -- A Complete Reference
+
+`.await` is a language keyword (not a method) that can only appear inside `async` functions or blocks. It pauses the current task, yields control back to the Tokio scheduler so other tasks can run, and resumes when the result is ready.
+
+### Categories of `.await` in this File
+
+#### File I/O (`tokio::fs`)
+
+Non-blocking wrappers around `std::fs`. Tokio runs the actual I/O on a dedicated blocking thread pool.
+
+```rust
+fs::create_dir_all("scratch").await?;           // line 105: create directory at startup
+fs::create_dir_all(&working_dir).await          // line 28:  create job workspace
+fs::write(&file_path, &req.source_code).await;  // line 39:  write CUDA source to disk
+fs::remove_dir_all(&working_dir).await;         // line 91:  delete job directory
+```
+
+Each yields while the OS performs the disk operation.
+
+#### Process Execution (`tokio::process::Command`)
+
+Spawns child processes without blocking the runtime thread.
+
+```rust
+Command::new("nvcc").arg(...).status().await;   // line 41-49: wait for exit code only
+Command::new(&bin_path).output().await;         // line 59-62: wait and capture all output
+```
+
+| Method | Returns | Captures output? | Use case |
+|---|---|---|---|
+| `.status().await` | `io::Result<ExitStatus>` | No | When you only need pass/fail (compilation) |
+| `.output().await` | `io::Result<Output>` | Yes (stdout + stderr) | When you need the program's output (execution) |
+
+#### Channel Send (`tokio::sync::mpsc`)
+
+```rust
+tx.send(Ok(ComputeResponse { ... })).await;     // lines 29, 53-56, 69-72, 75-78, 83-86
+```
+
+Puts a message into the bounded channel. Only yields if the buffer is full (all 100 slots occupied) -- pauses until the receiver consumes a message. If the receiver has been dropped (client disconnected), returns `Err` immediately.
+
+#### gRPC Server (`tonic`)
+
+```rust
+Server::builder()
+    .add_service(CudaExecutorServer::new(executor))
+    .serve(addr)
+    .await?;                                     // line 110-113
+```
+
+Enters an infinite accept loop. This `.await` never resolves during normal operation -- it permanently yields, handling requests as they arrive. The server is stopped with `Ctrl+C`.
+
+### The `while let Some(...) = stream.message().await?` Pattern
+
+On the client side, this is the idiomatic Rust pattern for consuming a gRPC stream:
+
+```rust
+while let Some(response) = stream.message().await? {
+    // process response
+}
+```
+
+`.message()` returns `Result<Option<ComputeResponse>, Status>`. The full sequence per iteration:
+
+1. `stream.message()` -- creates a future (not yet running)
+2. `.await` -- yields the task until the server sends a message or closes the stream
+3. `?` -- if `Err(status)`, return the error; if `Ok(option)`, unwrap the `Result`
+4. `while let Some(response)` -- if `Some`, bind to `response` and enter loop body; if `None`, break
+
+This is Rust's equivalent of `for await (const msg of stream)` in JavaScript or `stream.Recv()` in a Go loop.
+
+### Protobuf-to-Rust Name Mapping
+
+`tonic-build` automatically converts Protobuf's PascalCase to Rust's snake_case:
+
+| Protobuf | Generated Rust | Convention |
+|---|---|---|
+| `service CUDAExecutor` | `mod cuda_executor_server` / `mod cuda_executor_client` | snake_case modules |
+| `rpc ExecuteCode(...)` | `fn execute_code(...)` | snake_case function |
+| `message ComputeRequest` | `struct ComputeRequest` | PascalCase (unchanged -- already Rust convention) |
+
+So `client.execute_code(request)` in the client maps to protobuf's `ExecuteCode` RPC, which dispatches to the trait method `execute_code` on `HostExecutor`.
+
+---
+
 ## Execution Flow
 
 ### Server Startup
