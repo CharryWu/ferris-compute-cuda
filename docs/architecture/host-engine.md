@@ -475,3 +475,18 @@ So `client.execute_code(request)` in the client maps to protobuf's `ExecuteCode`
 9. **Stream results** -- send stdout/stderr through the channel to the client.
 10. **Cleanup** -- delete the job directory.
 11. **Stream ends** -- when the task finishes, `tx` is dropped, closing the channel and ending the gRPC stream.
+
+---
+
+## Resource Limits (Timeouts)
+
+To ensure system stability, the engine enforces a "Time-to-Live" (TTL) for every GPU kernel execution.
+
+### Timeout Guard
+
+The execution of the compiled binary is wrapped in a `tokio::time::timeout`.
+
+1. **The Future Race:** The engine polls the execution future and a timer future simultaneously.
+2. **Expiry:** If the timer expires first, the execution future is dropped.
+3. **Process Cleanup:** Dropping a `tokio::process::Child` (via the command's output future) automatically kills the child process, ensuring no "zombie" CUDA kernels remain in GPU memory.
+4. **Communication:** A specific timeout message is sent back through the gRPC stream to inform the user.
