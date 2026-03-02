@@ -5,7 +5,7 @@ use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 
 pub struct HostExecutor;
 
@@ -26,7 +26,12 @@ impl CudaExecutor for HostExecutor {
 
             // 1. Create temporary workspace
             if let Err(e) = fs::create_dir_all(&working_dir).await {
-                let _ = tx.send(Err(Status::internal(format!("Failed to create workspace: {}", e)))).await;
+                let _ = tx
+                    .send(Err(Status::internal(format!(
+                        "Failed to create workspace: {}",
+                        e
+                    ))))
+                    .await;
                 return;
             }
 
@@ -40,23 +45,25 @@ impl CudaExecutor for HostExecutor {
 
             // 3. Compile with NVCC
             let compile_status = Command::new("nvcc")
-                .arg(&file_path)
+                .arg(&req.file_name)
                 .args(&req.compiler_flags)
                 .arg("-o")
-                .arg(&bin_path)
+                .arg(&bin_name)
                 .current_dir(&working_dir)
                 .status()
                 .await;
 
             match compile_status {
                 Ok(s) if s.success() => {
-                    let _ = tx.send(Ok(ComputeResponse { 
-                        output: "🚀 Compilation successful. Running...".into(), 
-                        is_error: false 
-                    })).await;
-                    
+                    let _ = tx
+                        .send(Ok(ComputeResponse {
+                            output: "🚀 Compilation successful. Running...".into(),
+                            is_error: false,
+                        }))
+                        .await;
+
                     // 4. Execute the binary
-                    let output = Command::new(&bin_path)
+                    let output = Command::new(format!("./{}", bin_name))
                         .current_dir(&working_dir)
                         .output()
                         .await;
@@ -64,26 +71,32 @@ impl CudaExecutor for HostExecutor {
                     if let Ok(out) = output {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
-                        
+
                         if !stdout.is_empty() {
-                            let _ = tx.send(Ok(ComputeResponse { 
-                                output: stdout.to_string(), 
-                                is_error: false 
-                            })).await;
+                            let _ = tx
+                                .send(Ok(ComputeResponse {
+                                    output: stdout.to_string(),
+                                    is_error: false,
+                                }))
+                                .await;
                         }
                         if !stderr.is_empty() {
-                            let _ = tx.send(Ok(ComputeResponse { 
-                                output: stderr.to_string(), 
-                                is_error: true 
-                            })).await;
+                            let _ = tx
+                                .send(Ok(ComputeResponse {
+                                    output: stderr.to_string(),
+                                    is_error: true,
+                                }))
+                                .await;
                         }
                     }
                 }
                 _ => {
-                    let _ = tx.send(Ok(ComputeResponse { 
-                        output: "❌ Compilation failed.".into(), 
-                        is_error: true 
-                    })).await;
+                    let _ = tx
+                        .send(Ok(ComputeResponse {
+                            output: "❌ Compilation failed.".into(),
+                            is_error: true,
+                        }))
+                        .await;
                 }
             }
 
@@ -98,7 +111,7 @@ impl CudaExecutor for HostExecutor {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
+    let addr = "0.0.0.0:50051".parse()?;
     let executor = HostExecutor;
 
     // Ensure the base scratch directory exists before we start accepting jobs

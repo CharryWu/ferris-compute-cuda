@@ -1,6 +1,7 @@
 # --- Rust / Cargo ---
 # Standard Rust build artifacts
 /target/
+Cargo.lock
 # Backup files created by cargo fix
 **/*.rs.bk
 
