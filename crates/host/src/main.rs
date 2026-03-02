@@ -1,13 +1,15 @@
+mod utils;
+
 use common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer};
 use common::compute::{ComputeRequest, ComputeResponse};
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs;
 use tokio::process::Command as AsyncCommand;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
-
-mod utils;
 
 pub struct HostExecutor;
 
@@ -45,28 +47,20 @@ impl CudaExecutor for HostExecutor {
             let _ = fs::write(&file_path, &req.source_code).await;
 
             // 3. Compile with NVCC - ensure we use the correct x64 MSVC compiler if on Windows
-            let mut nvcc = AsyncCommand::new("nvcc");
+            let mut cmd = AsyncCommand::new("nvcc");
 
-            // let ccbin_path = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64";
-            // nvcc.arg("-ccbin").arg(&ccbin_path);
-            if let Some(ccbin_path) = utils::find_msvc_x64_bin() {
-                nvcc.arg("-ccbin").arg(&ccbin_path);
-                println!(
-                    "🔍 Auto-detect MSVC x64 compiler at: {}",
-                    ccbin_path.display()
-                );
-            } else {
-                println!(
-                    "⚠️  Warning: Could not auto-detect MSVC x64 compiler. Compilation may fail if not configured properly."
-                );
+            if let Some(ccbin) = utils::find_msvc_x64_bin() {
+                cmd.arg("-ccbin").arg(ccbin);
             }
-            let cmd = nvcc
+
+            let compile_status = cmd
                 .arg(&req.file_name)
                 .args(&req.compiler_flags)
                 .arg("-o")
-                .arg(&bin_name)
-                .current_dir(&working_dir);
-            let compile_status = cmd.status().await;
+                .arg(bin_name)
+                .current_dir(&working_dir)
+                .status()
+                .await;
 
             match compile_status {
                 Ok(s) if s.success() => {
@@ -77,28 +71,48 @@ impl CudaExecutor for HostExecutor {
                         }))
                         .await;
 
+                    let bin_path = working_dir.join(bin_name);
                     // 4. Execute the binary
-                    let output = AsyncCommand::new(format!("./{}", bin_name))
+                    let exec_future = AsyncCommand::new(bin_path)
                         .current_dir(&working_dir)
-                        .output()
-                        .await;
+                        .output();
 
-                    if let Ok(out) = output {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        let stderr = String::from_utf8_lossy(&out.stderr);
+                    match timeout(Duration::from_secs(30), exec_future).await {
+                        Ok(Ok(out)) => {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
 
-                        if !stdout.is_empty() {
+                            if !stdout.is_empty() {
+                                let _ = tx
+                                    .send(Ok(ComputeResponse {
+                                        output: stdout.to_string(),
+                                        is_error: false,
+                                    }))
+                                    .await;
+                            }
+                            if !stderr.is_empty() {
+                                let _ = tx
+                                    .send(Ok(ComputeResponse {
+                                        output: stderr.to_string(),
+                                        is_error: true,
+                                    }))
+                                    .await;
+                            }
+                        }
+                        Ok(Err(e)) => {
                             let _ = tx
                                 .send(Ok(ComputeResponse {
-                                    output: stdout.to_string(),
-                                    is_error: false,
+                                    output: format!("❌ Execution failed: {}", e),
+                                    is_error: true,
                                 }))
                                 .await;
                         }
-                        if !stderr.is_empty() {
+                        Err(_) => {
                             let _ = tx
                                 .send(Ok(ComputeResponse {
-                                    output: stderr.to_string(),
+                                    output:
+                                        "⏱️ Execution timed out after 30 seconds. Process killed."
+                                            .into(),
                                     is_error: true,
                                 }))
                                 .await;
@@ -115,7 +129,6 @@ impl CudaExecutor for HostExecutor {
                 }
             }
 
-            // 5. Cleanup: Delete the entire job directory
             let _ = fs::remove_dir_all(&working_dir).await;
             println!("🧹 Cleaned up job {}", job_id);
         });
@@ -126,15 +139,26 @@ impl CudaExecutor for HostExecutor {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // --- Pre-flight Check ---
+    if cfg!(windows) {
+        if let Some(path) = utils::find_msvc_x64_bin() {
+            println!("✅ Environment Check: MSVC x64 detected at {:?}", path);
+        } else {
+            eprintln!("❌ Environment Error: MSVC x64 compiler (cl.exe) not found.");
+            eprintln!(
+                "Please ensure 'Desktop development with C++' is installed in Visual Studio."
+            );
+            std::process::exit(1);
+        }
+    }
+
     let addr = "0.0.0.0:50051".parse()?;
     let executor = HostExecutor;
 
-    // Ensure the base scratch directory exists before we start accepting jobs
     fs::create_dir_all("scratch").await?;
 
     println!("🦀 Ferris-Compute-Cuda Host listening on {}", addr);
 
-    // Start the gRPC server
     Server::builder()
         .add_service(CudaExecutorServer::new(executor))
         .serve(addr)
