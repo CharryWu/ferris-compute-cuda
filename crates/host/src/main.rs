@@ -2,10 +2,12 @@ use common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer};
 use common::compute::{ComputeRequest, ComputeResponse};
 use std::path::Path;
 use tokio::fs;
-use tokio::process::Command;
+use tokio::process::Command as AsyncCommand;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
+
+mod utils;
 
 pub struct HostExecutor;
 
@@ -38,20 +40,33 @@ impl CudaExecutor for HostExecutor {
             let file_path = working_dir.join(&req.file_name);
             // Platform agnostic binary extension
             let bin_name = if cfg!(windows) { "app.exe" } else { "app.out" };
-            let bin_path = working_dir.join(bin_name);
 
             // 2. Write source code
             let _ = fs::write(&file_path, &req.source_code).await;
 
-            // 3. Compile with NVCC
-            let compile_status = Command::new("nvcc")
+            // 3. Compile with NVCC - ensure we use the correct x64 MSVC compiler if on Windows
+            let mut nvcc = AsyncCommand::new("nvcc");
+
+            // let ccbin_path = r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64";
+            // nvcc.arg("-ccbin").arg(&ccbin_path);
+            if let Some(ccbin_path) = utils::find_msvc_x64_bin() {
+                nvcc.arg("-ccbin").arg(&ccbin_path);
+                println!(
+                    "🔍 Auto-detect MSVC x64 compiler at: {}",
+                    ccbin_path.display()
+                );
+            } else {
+                println!(
+                    "⚠️  Warning: Could not auto-detect MSVC x64 compiler. Compilation may fail if not configured properly."
+                );
+            }
+            let cmd = nvcc
                 .arg(&req.file_name)
                 .args(&req.compiler_flags)
                 .arg("-o")
                 .arg(&bin_name)
-                .current_dir(&working_dir)
-                .status()
-                .await;
+                .current_dir(&working_dir);
+            let compile_status = cmd.status().await;
 
             match compile_status {
                 Ok(s) if s.success() => {
@@ -63,7 +78,7 @@ impl CudaExecutor for HostExecutor {
                         .await;
 
                     // 4. Execute the binary
-                    let output = Command::new(format!("./{}", bin_name))
+                    let output = AsyncCommand::new(format!("./{}", bin_name))
                         .current_dir(&working_dir)
                         .output()
                         .await;
