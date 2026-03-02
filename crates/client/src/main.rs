@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let request = tonic::Request::new(ComputeRequest {
         source_code,
-        file_name,
+        file_name: file_name.clone(),
         compiler_flags: args.flags,
     });
 
