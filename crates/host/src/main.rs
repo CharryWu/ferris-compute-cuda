@@ -11,6 +11,26 @@ use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
 
+/// The Interceptor: This function runs BEFORE the service logic.
+/// It checks if the 'x-ferris-token' matches our server's secret.
+fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
+    // 1. Get the secret token from the Environment (fallback to a default for dev)
+    let secret_token =
+        std::env::var("FERRIS_AUTH_TOKEN").unwrap_or_else(|_| "ferris-secret".to_string());
+
+    // 2. Look for the 'x-ferris-token' header
+    match req.metadata().get("x-ferris-token") {
+        Some(token) if token == secret_token.as_str() => {
+            // Token matches! Pass the request through to the executor.
+            Ok(req)
+        }
+        _ => {
+            // Token missing or wrong. Reject immediately.
+            Err(Status::unauthenticated("Invalid or missing auth token"))
+        }
+    }
+}
+
 pub struct HostExecutor;
 
 #[tonic::async_trait]
@@ -157,10 +177,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::create_dir_all("scratch").await?;
 
-    println!("🦀 Ferris-Compute-Cuda Host listening on {}", addr);
+    println!("🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)", addr);
 
     Server::builder()
-        .add_service(CudaExecutorServer::new(executor))
+        .add_service(CudaExecutorServer::with_interceptor(executor, check_auth))
         .serve(addr)
         .await?;
 
