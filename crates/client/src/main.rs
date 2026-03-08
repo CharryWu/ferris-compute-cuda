@@ -19,18 +19,24 @@ struct Args {
     #[arg(short, long)]
     flags: Vec<String>,
 
-    #[arg(short, long)]
+    #[arg(short, long, env = "FERRIS_AUTH_TOKEN")]
     token: String, // For authentication purpose
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///////// PRE-FLIGHT CHECKS /////////
+    // 1. Load .env file into process env variable
+    let _ = dotenvy::dotenv();
+
+    // 2. Parse CLI arguments (Clap handles the env fallback automatically now)
     let args = Args::parse();
 
-    // 1. Read the local CUDA file
+    // 3. Read the local CUDA file
     let source_code = std::fs::read_to_string(&args.file)
         .map_err(|e| format!("Could not read file {}: {}", args.file.display(), e))?;
 
+    // 4. Validate file extension
     let file_name = args
         .file
         .file_name()
@@ -55,13 +61,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    ///////// CONNECTION /////////
     println!(
         "{} Connecting to host at {}...",
         "🚀".bold(),
         args.server.cyan()
     );
 
-    // 2. Connect to the host
+    // 1. Connect to the host
     let mut client = CudaExecutorClient::connect(args.server).await?;
 
     let mut request = tonic::Request::new(ComputeRequest {
@@ -82,14 +89,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()?;
     request.metadata_mut().insert("x-ferris-token", token_value);
 
-    // 3. Receive the stream
+    ///////// EXECUTION RESULT DISPLAY AND ERROR HANDLING /////////
     let response = client.execute_code(request).await;
     match response {
         Ok(res) => {
             let mut stream = res.into_inner();
             while let Some(msg) = stream.message().await? {
                 if msg.is_error {
-                    // Print compiler errors or stderr in red
+                    // Print compiler errors or GPU runtime error outputs in red
                     eprintln!("{}", msg.output.red());
                 } else {
                     // Print standard output in green/white
@@ -97,11 +104,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // Authentication error: token not valid
         Err(e) if e.code() == tonic::Code::Unauthenticated => {
-            eprintln!("🛑 Auth Error: Access denied. Check your --token.");
+            eprintln!(
+                "{}\n{}",
+                "🛑 Auth Error: Access denied. Check your --token:".red(),
+                args.token.bold().yellow()
+            );
         }
+        // RPC error: network issue or server error
         Err(e) => {
-            eprintln!("❌ RPC Error: {}", e.message());
+            eprintln!("{}\n{}", "❌ RPC Error: {}".red(), e.message().magenta());
         }
     }
 
