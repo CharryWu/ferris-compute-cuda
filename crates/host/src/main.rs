@@ -57,6 +57,23 @@ pub struct HostExecutor;
 impl CudaExecutor for HostExecutor {
     type ExecuteCodeStream = ReceiverStream<Result<ComputeResponse, Status>>;
 
+    async fn get_gpu_status(
+        &self,
+        _request: Request<common::compute::Empty>,
+    ) -> Result<Response<common::compute::GpuStatus>, Status> {
+        if let Some((name, temp, used, total, load)) = utils::get_nvidia_status().await {
+            Ok(Response::new(common::compute::GpuStatus {
+                gpu_name: name,
+                temperature_celsius: temp,
+                memory_used_mb: used,
+                memory_total_mb: total,
+                load_percentage: load,
+            }))
+        } else {
+            Err(Status::unavailable("Could not query NVIDIA SMI"))
+        }
+    }
+
     async fn execute_code(
         &self,
         request: Request<ComputeRequest>,

@@ -3,7 +3,19 @@ package compute;
 
 service CUDAExecutor {
     // Client sends code, Host streams back compilation/execution logs
-    rpc ExecuteCode (ComputeRequest) returns (stream ComputeResponse);
+    rpc ExecuteCode(ComputeRequest) returns (stream ComputeResponse);
+    // Get current status of the GPU(s)
+    rpc GetGpuStatus(Empty) returns (GpuStatus);
+}
+
+message Empty {}
+
+message GpuStatus {
+    string gpu_name = 1;
+    uint32 temperature_celsius = 2;
+    uint32 memory_used_mb = 3;
+    uint32 memory_total_mb = 4;
+    uint32 load_percentage = 5;
 }
 
 message ComputeRequest {
@@ -13,6 +25,6 @@ message ComputeRequest {
 }
 
 message ComputeResponse {
-    string output = 1;      // Could be stdout, stderr, or status updates
+    string output = 1; // Could be stdout, stderr, or status updates
     bool is_error = 2;
 }

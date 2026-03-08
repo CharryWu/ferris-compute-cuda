@@ -68,11 +68,19 @@ Host: `cargo run -p host`
 Client: `cargo run -p client -- --server "http://localhost:50051" ./kernel.cu`
 
 | Method | Where to find it | Priority |
-|---|---|---|
+| --- | --- | --- |
 | CLI Argument | cargo run -- --token "xyz" | 1 (Highest) |
 | Shell Variable | export FERRIS_AUTH_TOKEN="xyz" | 2 |
 | .env File | FERRIS_AUTH_TOKEN=xyz | 3 |
 | Hardcoded Default | None (Application Error) | 4 (Lowest) |
+
+### 📊 Check GPU Status
+
+You can now check the health of the remote GPU before running a job:
+
+```bash
+cargo run -p client -- status --server "http://10.0.0.181:50051"
+```
 
 ---
 

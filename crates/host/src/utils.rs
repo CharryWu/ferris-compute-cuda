@@ -80,3 +80,28 @@ pub fn find_msvc_x64_bin() -> Option<PathBuf> {
         None
     }
 }
+
+pub async fn get_nvidia_status() -> Option<(String, u32, u32, u32, u32)> {
+    let output = SyncCommand::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = stdout.split(',').map(|s| s.trim()).collect();
+
+    if parts.len() >= 5 {
+        Some((
+            parts[0].to_string(),
+            parts[1].parse().unwrap_or(0),
+            parts[2].parse().unwrap_or(0),
+            parts[3].parse().unwrap_or(0),
+            parts[4].parse().unwrap_or(0),
+        ))
+    } else {
+        None
+    }
+}
