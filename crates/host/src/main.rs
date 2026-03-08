@@ -1,5 +1,6 @@
 mod utils;
 
+use clap::Parser;
 use common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer};
 use common::compute::{ComputeRequest, ComputeResponse};
 use std::path::Path;
@@ -10,7 +11,8 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
-use clap::Parser;
+
+const EXECUTION_TIMEOUT_SECS: u64 = 30; // Timeout for executing compiled binaries
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -33,6 +35,20 @@ fn check_auth(req: Request<()>, expected_token: String) -> Result<Request<()>, S
             Err(Status::unauthenticated("Invalid or missing auth token"))
         }
     }
+}
+
+async fn send_output(
+    tx: &mpsc::Sender<Result<ComputeResponse, Status>>,
+    output: String,
+    is_error: bool,
+) {
+    if !output.is_empty() {
+        let _ = tx.send(Ok(ComputeResponse { output, is_error })).await;
+    }
+}
+
+fn u8_to_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_string()
 }
 
 pub struct HostExecutor;
@@ -77,79 +93,82 @@ impl CudaExecutor for HostExecutor {
                 cmd.arg("-ccbin").arg(ccbin);
             }
 
-            let compile_status = cmd
+            let compile_result = cmd
                 .arg(&req.file_name)
                 .args(&req.compiler_flags)
                 .arg("-o")
                 .arg(bin_name)
                 .current_dir(&working_dir)
-                .status()
+                .output() // don't use .status() since it doesn't capture compiler stdout/stderr
                 .await;
 
-            match compile_status {
-                Ok(s) if s.success() => {
-                    let _ = tx
-                        .send(Ok(ComputeResponse {
-                            output: "🚀 Compilation successful. Running...".into(),
-                            is_error: false,
-                        }))
+            match compile_result {
+                Ok(compile_output) => {
+                    // Capture compiler output and stream back to client
+                    let compiler_stdout = u8_to_string(&compile_output.stdout);
+                    let compiler_stderr = u8_to_string(&compile_output.stderr);
+
+                    // Stream compiler output back to client in real-time (if any)
+                    // The capturing & sending must happen before checking the status
+                    // otherwise nothing will be captured
+                    send_output(&tx, compiler_stdout, false).await;
+                    if !compiler_stderr.is_empty() {
+                        send_output(
+                            &tx,
+                            format!("❌ Compilation failed. Full error:\n{}", compiler_stderr),
+                            true,
+                        )
+                        .await;
+                    }
+                    // Only proceed to execution if compilation succeeded
+                    if compile_output.status.success() {
+                        send_output(
+                            &tx,
+                            "🚀 Compilation successful. Running binary...".into(),
+                            false,
+                        )
                         .await;
 
-                    let bin_path = working_dir.join(bin_name);
-                    // 4. Execute the binary
-                    let exec_future = AsyncCommand::new(bin_path)
-                        .current_dir(&working_dir)
-                        .output();
+                        let bin_path = working_dir.join(bin_name);
+                        // 4. Execute the binary
+                        let exec_future = AsyncCommand::new(bin_path)
+                            .current_dir(&working_dir)
+                            .output();
 
-                    match timeout(Duration::from_secs(30), exec_future).await {
-                        Ok(Ok(out)) => {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let stderr = String::from_utf8_lossy(&out.stderr);
+                        // Set a timeout for execution to prevent hanging processes
+                        match timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS), exec_future)
+                            .await
+                        {
+                            Ok(Ok(exec_output)) => {
+                                let exec_stdout = u8_to_string(&exec_output.stdout);
+                                let exec_stderr = u8_to_string(&exec_output.stderr);
 
-                            if !stdout.is_empty() {
-                                let _ = tx
-                                    .send(Ok(ComputeResponse {
-                                        output: stdout.to_string(),
-                                        is_error: false,
-                                    }))
-                                    .await;
+                                // Capture execution output and stream back to client
+                                send_output(&tx, exec_stdout, false).await;
+                                send_output(&tx, exec_stderr, true).await;
                             }
-                            if !stderr.is_empty() {
-                                let _ = tx
-                                    .send(Ok(ComputeResponse {
-                                        output: stderr.to_string(),
-                                        is_error: true,
-                                    }))
-                                    .await;
+                            Ok(Err(e)) => {
+                                send_output(&tx, format!("❌ Execution failed: {}", e), true).await;
                             }
-                        }
-                        Ok(Err(e)) => {
-                            let _ = tx
-                                .send(Ok(ComputeResponse {
-                                    output: format!("❌ Execution failed: {}", e),
-                                    is_error: true,
-                                }))
+                            Err(_) => {
+                                send_output(
+                                    &tx,
+                                    "⏱️ Execution timed out after 30 seconds. Process killed."
+                                        .into(),
+                                    true,
+                                )
                                 .await;
-                        }
-                        Err(_) => {
-                            let _ = tx
-                                .send(Ok(ComputeResponse {
-                                    output:
-                                        "⏱️ Execution timed out after 30 seconds. Process killed."
-                                            .into(),
-                                    is_error: true,
-                                }))
-                                .await;
+                            }
                         }
                     }
                 }
                 _ => {
-                    let _ = tx
-                        .send(Ok(ComputeResponse {
-                            output: "❌ Compilation failed.".into(),
-                            is_error: true,
-                        }))
-                        .await;
+                    send_output(
+                        &tx,
+                        "❌ Compilation failed. Internal error occurred.".into(),
+                        true,
+                    )
+                    .await;
                 }
             }
 
@@ -187,7 +206,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::create_dir_all("scratch").await?;
 
-    println!("🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)", addr);
+    println!(
+        "🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)",
+        addr
+    );
 
     // 3. Pass token into interceptor closure. We clone 'args.token' into closure
     // Use 'move' so the closure takes its own copy of 'args.token'
@@ -195,10 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let token_to_verify = args.token.clone();
         check_auth(req, token_to_verify)
     });
-    Server::builder()
-        .add_service(service)
-        .serve(addr)
-        .await?;
+    Server::builder().add_service(service).serve(addr).await?;
 
     Ok(())
 }
