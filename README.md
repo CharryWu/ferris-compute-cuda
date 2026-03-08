@@ -58,6 +58,15 @@ cargo run -p client -- --server "http://10.0.0.181:50051" ./examples/matrix_addi
 
 ```
 
+### 🔑 Authentication
+
+1. **CLI Flag:** `--token "my-secret"`
+2. **.env File:** Create a `.env` file with `FERRIS_AUTH_TOKEN=my-secret`
+
+**Usage:**
+Host: `cargo run -p host`
+Client: `cargo run -p client -- --server "http://localhost:50051" ./kernel.cu`
+
 ---
 
 ## 🛡 Security & Resource Management

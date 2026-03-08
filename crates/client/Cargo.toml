@@ -8,5 +8,6 @@ edition.workspace = true
 common = { path = "../common" }
 tonic = "0.12"
 tokio = { version = "1", features = ["full"] }
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 colored = "2.1"
+dotenvy = "0.15.7"

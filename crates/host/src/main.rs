@@ -10,17 +10,21 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, transport::Server};
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct HostArgs {
+    // Auth token. Priority: CLI Flag > Env Var > .env file
+    #[arg(short, long, env = "FERRIS_AUTH_TOKEN")]
+    token: String,
+}
 
 /// The Interceptor: This function runs BEFORE the service logic.
 /// It checks if the 'x-ferris-token' matches our server's secret.
-fn check_auth(req: Request<()>) -> Result<Request<()>, Status> {
-    // 1. Get the secret token from the Environment (fallback to a default for dev)
-    let secret_token =
-        std::env::var("FERRIS_AUTH_TOKEN").unwrap_or_else(|_| "ferris-secret".to_string());
-
-    // 2. Look for the 'x-ferris-token' header
+fn check_auth(req: Request<()>, expected_token: String) -> Result<Request<()>, Status> {
     match req.metadata().get("x-ferris-token") {
-        Some(token) if token == secret_token.as_str() => {
+        Some(token) if token == expected_token.as_str() => {
             // Token matches! Pass the request through to the executor.
             Ok(req)
         }
@@ -172,6 +176,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // 1. Load .env file
+    let _ = dotenvy::dotenv();
+
+    // 2. Parse CLI arguments (Clap handles the env fallback automatically now)
+    let args = HostArgs::parse();
+
     let addr = "0.0.0.0:50051".parse()?;
     let executor = HostExecutor;
 
@@ -179,8 +189,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)", addr);
 
+    // 3. Pass token into interceptor closure. We clone 'args.token' into closure
+    // Use 'move' so the closure takes its own copy of 'args.token'
+    let service = CudaExecutorServer::with_interceptor(executor, move |req| {
+        let token_to_verify = args.token.clone();
+        check_auth(req, token_to_verify)
+    });
     Server::builder()
-        .add_service(CudaExecutorServer::with_interceptor(executor, check_auth))
+        .add_service(service)
         .serve(addr)
         .await?;
 
