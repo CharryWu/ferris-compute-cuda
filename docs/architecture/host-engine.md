@@ -1,41 +1,201 @@
 # 📄 Architecture: Host Execution Engine
 
-**File:** [crates/host/src/main.rs](/crates/host/src/main.rs)
+**Files:** [crates/host/src/main.rs](/crates/host/src/main.rs) · [crates/host/src/utils.rs](/crates/host/src/utils.rs)
 
-The Host is the GPU-side daemon that receives CUDA source code over gRPC, compiles it with `nvcc`, executes the resulting binary, and streams output back to the client in real time.
+The Host is the GPU-side daemon that receives a workspace of CUDA source files over gRPC, compiles them with `nvcc`, executes the resulting binary, and streams output back to the client in real time. It is also responsible for authentication gating and GPU telemetry.
+
+## End-to-End Execution Flow
+
+```mermaid
+flowchart TD
+    subgraph CLIENT["🖥️ Client"]
+        C1["Walk input paths<br/>gather_files_recursive()"]
+        C2{"Multi-file?"}
+        C3["map: relative_path → content<br/>entry_point = first input"]
+        C4["gRPC: send ComputeRequest<br/>(files map + entry_point + flags)"]
+    end
+
+    subgraph HOST["🖥️ Host"]
+        H1{"Auth valid?"}
+        H1_ERR["🛑 Rejected"]
+        H2["prepare_workspace()<br/>Reconstruct dir tree in scratch/&lt;uuid&gt;/"]
+        H3["build_nvcc_command()"]
+        H3_NOTE{"Multi-file?"}
+        H3_RDC["Add -rdc=true"]
+        H4["nvcc compile"]
+        H5{"Compile OK?"}
+        H5_ERR["❌ Compilation failed + stderr"]
+        H6["Execute binary<br/>(30s timeout)"]
+        H7{"Result?"}
+        H7_OK["Stream stdout + stderr"]
+        H7_FAIL["❌ Execution failed"]
+        H7_TIMEOUT["⏱️ Timed out"]
+        H8["🧹 Cleanup scratch/&lt;uuid&gt;/"]
+    end
+
+    subgraph OUTPUT["📡 Client Output"]
+        O1["Stream messages via gRPC"]
+        O2{"is_error?"}
+        O2_OK["stdout"]
+        O2_ERR["stderr (red)"]
+    end
+
+    C1 --> C2
+    C2 -->|"single"| C3
+    C2 -->|"multi"| C3
+    C3 --> C4
+
+    C4 -.->|"gRPC"| H1
+    H1 -->|"no"| H1_ERR
+    H1 -->|"yes"| H2
+    H2 --> H3
+    H3 --> H3_NOTE
+    H3_NOTE -->|"yes"| H3_RDC --> H4
+    H3_NOTE -->|"no"| H4
+    H4 --> H5
+    H5 -->|"fail"| H5_ERR --> H8
+    H5 -->|"success"| H6
+    H6 --> H7
+    H7 -->|"success"| H7_OK --> H8
+    H7 -->|"error"| H7_FAIL --> H8
+    H7 -->|"timeout"| H7_TIMEOUT --> H8
+
+    H5_ERR -.->|"tx.send()"| O1
+    H7_OK -.->|"tx.send()"| O1
+    H7_FAIL -.->|"tx.send()"| O1
+    H7_TIMEOUT -.->|"tx.send()"| O1
+    H8 -.->|"tx dropped"| O1
+
+    O1 --> O2
+    O2 -->|"false"| O2_OK
+    O2 -->|"true"| O2_ERR
+
+    style H1_ERR fill:#fee,stroke:#c00,color:#900
+    style H5_ERR fill:#fee,stroke:#c00,color:#900
+    style H7_FAIL fill:#fee,stroke:#c00,color:#900
+    style H7_TIMEOUT fill:#fec,stroke:#a80,color:#740
+    style H7_OK fill:#efe,stroke:#0a0,color:#070
+    style H3_RDC fill:#eef,stroke:#06c,color:#036
+```
 
 ---
 
-## Imports Breakdown
+## File Layout
+
+| File | Responsibility |
+|---|---|
+| `main.rs` | gRPC service implementation, job orchestration, auth interceptor, startup |
+| `utils.rs` | Platform utilities: MSVC discovery, GPU status, nvcc command builder, workspace reconstruction |
+
+---
+
+## Imports Breakdown (`main.rs`)
 
 ```rust
+use anyhow::Context;
+use clap::Parser;
 use common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer};
 use common::compute::{ComputeRequest, ComputeResponse};
 use std::path::Path;
+use std::time::Duration;
 use tokio::fs;
-use tokio::process::Command;
+use tokio::process::Command as AsyncCommand;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 ```
 
 | Import | Purpose |
 |---|---|
+| `anyhow::Context` | Adds the `.context("message")` method to `Result`, enriching error messages with human-readable context without losing the original cause. |
+| `clap::Parser` | Derive macro that turns a Rust struct into a fully-featured CLI argument parser, including environment variable fallback. |
 | `CudaExecutor` | The **trait** auto-generated from the protobuf `service CUDAExecutor`. The host must implement this trait to handle RPCs. |
-| `CudaExecutorServer` | A wrapper struct that plugs a `CudaExecutor` implementation into a `tonic` gRPC server. |
+| `CudaExecutorServer` | A wrapper that plugs a `CudaExecutor` implementation into a `tonic` gRPC server, including support for interceptors. |
 | `ComputeRequest` / `ComputeResponse` | Auto-generated Rust structs from the protobuf `message` definitions. |
-| `std::path::Path` | Borrowed path reference (the immutable counterpart of `PathBuf`). Used for path manipulation. |
-| `tokio::fs` | Async file system operations -- non-blocking versions of `std::fs`. Safe to use inside Tokio tasks. |
-| `tokio::process::Command` | Async version of `std::process::Command`. Spawns child processes without blocking the runtime. |
-| `tokio::sync::mpsc` | Multi-producer, single-consumer async channel. Used to pipe results from the background task to the gRPC stream. |
+| `std::path::Path` | Borrowed path reference (the immutable counterpart of `PathBuf`). Used for path manipulation without heap allocation. |
+| `std::time::Duration` | Used to express the binary execution timeout as a typed value rather than a raw integer. |
+| `tokio::fs` | Async file system operations — non-blocking versions of `std::fs`. Safe to use inside Tokio tasks. |
+| `AsyncCommand` | `tokio::process::Command` aliased for clarity. Spawns child processes without blocking the Tokio runtime thread. |
+| `tokio::sync::mpsc` | Multi-producer, single-consumer async channel. Pipes results from the background job task to the gRPC stream. |
+| `tokio::time::timeout` | Wraps a future with a deadline; returns `Err(Elapsed)` if the deadline fires first. |
 | `ReceiverStream` | Adapts an `mpsc::Receiver` into a `Stream` that tonic can send over gRPC. |
 | `Server` | Tonic's gRPC server builder. Used in `main()` to bind the service to a port. |
-| `Request` / `Response` | Tonic wrappers around the raw protobuf messages, carrying metadata like headers. |
-| `Status` | gRPC status codes (like HTTP status codes). Used to signal errors such as `INTERNAL` or `NOT_FOUND`. |
+| `Request` / `Response` / `Status` | Tonic wrappers around protobuf messages carrying metadata (headers, extensions). `Status` carries gRPC error codes. |
 
-### `tokio::fs` vs `std::fs`
+---
 
-This is a key distinction for backend developers. `std::fs::write` is **synchronous** -- it blocks the OS thread until the disk write completes. Inside a Tokio task, this starves other tasks sharing that thread. `tokio::fs::write` is **async** -- it offloads the blocking I/O to a dedicated thread pool and yields the Tokio worker thread back to the scheduler. Always prefer `tokio::fs` inside async contexts.
+## Configuration & CLI: `HostArgs`
+
+```rust
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct HostArgs {
+    #[arg(short, long, env = "FERRIS_AUTH_TOKEN")]
+    token: String,
+}
+```
+
+The host is configured entirely via the command line. `clap`'s `env` attribute provides a **priority hierarchy** for the token:
+
+1. `--token <value>` — explicit CLI flag (highest priority)
+2. `FERRIS_AUTH_TOKEN` environment variable (set manually or loaded from `.env`)
+3. `.env` file on disk (loaded by `dotenvy` at startup)
+
+This matches the client's token resolution strategy, ensuring the two sides can be configured symmetrically.
+
+---
+
+## Authentication: `check_auth`
+
+```rust
+fn check_auth(req: Request<()>, expected_token: String) -> Result<Request<()>, Status> {
+    match req.metadata().get("x-ferris-token") {
+        Some(token) if token == expected_token.as_str() => Ok(req),
+        _ => Err(Status::unauthenticated("Invalid or missing auth token")),
+    }
+}
+```
+
+This function is registered as a **tonic interceptor** — middleware that runs before any RPC handler. Every incoming request must carry the correct token in its gRPC metadata under the key `x-ferris-token`. If the token is missing or wrong, the request is rejected with `UNAUTHENTICATED` before it reaches `HostExecutor`.
+
+### Why an interceptor instead of checking inside each handler?
+
+An interceptor applies the check centrally. Adding a second RPC (like `GetGpuStatus`) doesn't require remembering to add auth logic there too — the interceptor covers all methods automatically.
+
+### Token Ownership Inside the Closure
+
+The interceptor is registered with `with_interceptor(executor, move |req| { ... })`. The `move` closure captures `args.token` by ownership. Since the closure is called for every request (it's `FnMut`, not `FnOnce`), the token is `.clone()`d on each invocation so the closure retains its copy for subsequent calls.
+
+---
+
+## Utility Helpers
+
+### `send_output`
+
+```rust
+async fn send_output(
+    tx: &mpsc::Sender<Result<ComputeResponse, Status>>,
+    output: String,
+    is_error: bool,
+) {
+    if !output.is_empty() {
+        let _ = tx.send(Ok(ComputeResponse { output, is_error })).await;
+    }
+}
+```
+
+A thin wrapper that skips sending empty strings (avoiding blank lines on the client) and silently drops the result if the receiver has been dropped (client disconnected). The `let _ =` pattern explicitly discards the `Result`, signalling to the compiler that the error is intentionally ignored.
+
+### `u8_to_string`
+
+```rust
+fn u8_to_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_string()
+}
+```
+
+Process output (`stdout`, `stderr`) is raw bytes — not guaranteed to be valid UTF-8. `from_utf8_lossy` converts bytes to a string, replacing any invalid sequences with the Unicode replacement character `U+FFFD` (&#xFFFD;). This is "lossy" in that information can be lost, but it **never panics**. It returns `Cow<str>` (zero-copy if input is already valid UTF-8); `.to_string()` forces it into an owned `String`.
 
 ---
 
@@ -45,22 +205,18 @@ This is a key distinction for backend developers. `std::fs::write` is **synchron
 pub struct HostExecutor;
 ```
 
-This is a **unit struct** -- a struct with no fields. It has zero size at runtime (ZST: zero-sized type). It exists purely to be the "receiver" for the trait implementation. Think of it as a namespace for methods.
-
-In Rust, you cannot implement a trait on "nothing" -- you need a type. `HostExecutor` is that type. Since it holds no state, it costs nothing to create or pass around.
+A **unit struct** — a struct with no fields and zero runtime size (ZST: zero-sized type). It exists purely as the receiver for the trait implementation. Since it holds no state, it costs nothing to create or pass around.
 
 ---
 
-## `#[tonic::async_trait]` -- Async Traits
+## `#[tonic::async_trait]` — Async Traits
 
 ```rust
 #[tonic::async_trait]
 impl CudaExecutor for HostExecutor {
 ```
 
-Rust traits cannot natively contain `async fn` methods (as of Rust 2024, this is stabilizing but tonic still uses the macro). The `#[tonic::async_trait]` procedural macro rewrites `async fn` methods into regular functions that return `Pin<Box<dyn Future>>`. This is the same `async_trait` crate re-exported by tonic.
-
-Without this macro, the compiler would reject `async fn execute_code(...)` inside a trait impl.
+Rust traits cannot natively contain `async fn` methods (the stabilization is ongoing; tonic still uses the macro). The `#[tonic::async_trait]` procedural macro rewrites `async fn` methods into regular functions returning `Pin<Box<dyn Future>>`. Without this macro, the compiler would reject `async fn execute_code(...)` inside a trait impl.
 
 ---
 
@@ -70,93 +226,82 @@ Without this macro, the compiler would reject `async fn execute_code(...)` insid
 type ExecuteCodeStream = ReceiverStream<Result<ComputeResponse, Status>>;
 ```
 
-This is an **associated type** -- the trait `CudaExecutor` declares that implementors must specify what type of stream `ExecuteCode` returns. This project uses `ReceiverStream`, which wraps an `mpsc::Receiver`.
-
-The full type reads as: "a stream that yields `Result<ComputeResponse, Status>` items" -- each item is either a successful response message or a gRPC error.
+The `CudaExecutor` trait requires implementors to specify what type of stream `execute_code` returns. This project uses `ReceiverStream`, which wraps an `mpsc::Receiver`. The full type reads: "a stream that yields `Result<ComputeResponse, Status>` items" — each item is either a successful response or a gRPC error.
 
 ---
 
-## The `execute_code` Method Signature
+## `get_gpu_status`
+
+```rust
+async fn get_gpu_status(
+    &self,
+    _request: Request<common::compute::Empty>,
+) -> Result<Response<common::compute::GpuStatus>, Status> {
+    if let Some((name, temp, used, total, load)) = utils::get_nvidia_status().await {
+        Ok(Response::new(common::compute::GpuStatus { ... }))
+    } else {
+        Err(Status::unavailable("Could not query NVIDIA SMI"))
+    }
+}
+```
+
+A unary RPC that delegates to `utils::get_nvidia_status()`, which shells out to `nvidia-smi` and parses its CSV output. If `nvidia-smi` is unavailable or returns unexpected output, the RPC returns `UNAVAILABLE` rather than crashing. The `_request` prefix on the parameter suppresses the "unused variable" warning — the request body is `Empty` and carries no useful data.
+
+---
+
+## `execute_code` — Spawning the Job
 
 ```rust
 async fn execute_code(
     &self,
     request: Request<ComputeRequest>,
 ) -> Result<Response<Self::ExecuteCodeStream>, Status> {
+    let req = request.into_inner();
+    let (tx, rx) = mpsc::channel(100);
+
+    tokio::spawn(async move {
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let working_dir = Path::new("scratch").join(&job_id);
+
+        if let Err(e) = run_job(&tx, req, &working_dir).await {
+            send_output(&tx, format!("❌ Internal error: {}", e), true).await;
+        }
+
+        // Cleanup the working directory regardless of job outcome
+        let _ = fs::remove_dir_all(&working_dir).await;
+        println!("🧹 Cleaned up job {}", job_id);
+    });
+
+    Ok(Response::new(ReceiverStream::new(rx)))
+}
 ```
 
-| Parameter | Meaning |
-|---|---|
-| `&self` | Borrows the `HostExecutor`. Since it's a ZST, this is essentially free. The `&` means "I'm reading, not consuming." |
-| `Request<ComputeRequest>` | Tonic wrapper holding the decoded protobuf message plus gRPC metadata (headers, extensions). |
-| `Result<Response<...>, Status>` | Returns either a success response containing the stream, or a gRPC error status. |
-| `Self::ExecuteCodeStream` | Refers to the associated type defined above -- `ReceiverStream<Result<ComputeResponse, Status>>`. |
+This method's only job is to set up the channel, spawn the background task, and return the stream immediately. The actual pipeline lives in `run_job`.
 
----
+### `request.into_inner()`
 
-## `request.into_inner()`
+`.into_inner()` **consumes** the `Request<ComputeRequest>` wrapper and returns the inner `ComputeRequest`. The word "into" in Rust conventionally means "take ownership and transform." After this call, `request` no longer exists.
 
-```rust
-let req = request.into_inner();
-```
-
-`.into_inner()` **consumes** the `Request` wrapper and returns the inner `ComputeRequest`. The word "into" in Rust conventionally means "take ownership and transform" (as opposed to `.as_ref()` which borrows). After this call, `request` no longer exists -- its ownership moved into `req`.
-
----
-
-## The `mpsc` Channel Pattern
+### The `mpsc` Channel Pattern
 
 ```rust
 let (tx, rx) = mpsc::channel(100);
 ```
 
-This creates a **bounded async channel** with a buffer of 100 messages:
+Creates a **bounded async channel** with a buffer of 100 messages:
 
-- `tx` (transmitter / sender) -- used inside the spawned task to push responses.
-- `rx` (receiver) -- wrapped in `ReceiverStream` and returned to tonic, which drains it to the client.
+- `tx` (transmitter) — passed into the spawned task to push responses.
+- `rx` (receiver) — wrapped in `ReceiverStream` and returned to tonic, which drains it to the client.
 
-The buffer size of 100 means the sender can push up to 100 messages before it has to wait for the receiver to consume them. This decouples the compilation speed from the network speed.
+The buffer size of 100 means the sender can push up to 100 messages before it must wait for the receiver to consume some. This decouples compilation speed from network speed.
 
-### Why this pattern?
+### `tokio::spawn(async move { ... })`
 
-The method must return the stream **immediately** (so the client can start listening), but the compilation takes time. The solution: spawn a background task that does the work and sends results through the channel. The stream starts delivering messages as soon as the first one is sent.
+Spawns a new **Tokio task** — a lightweight unit of concurrent execution (not an OS thread). The `move` keyword transfers ownership of `tx` and `req` into the async block. Without `move`, the block would try to borrow them, but since the block outlives `execute_code`, the borrow checker would reject it.
 
-```
-execute_code() returns immediately
-       │
-       ├── returns ReceiverStream(rx) ──> tonic ──> gRPC ──> client
-       │
-       └── spawns background task
-               │
-               ├── writes file
-               ├── runs nvcc ──> tx.send(compile result)
-               ├── runs binary ──> tx.send(stdout) / tx.send(stderr)
-               └── cleans up
-```
+`tokio::spawn` returns a `JoinHandle` that is deliberately not bound — "fire and forget." The stream via `rx` is the only communication channel back to the caller.
 
----
-
-## `tokio::spawn(async move { ... })`
-
-```rust
-tokio::spawn(async move {
-    // ...
-});
-```
-
-This spawns a new **Tokio task** -- a lightweight unit of concurrent execution (not an OS thread). Key details:
-
-### `async move`
-
-The `move` keyword **transfers ownership** of all captured variables (`tx`, `req`) into the async block. Without `move`, the block would try to borrow them, but since the block outlives `execute_code` (it runs in the background), the borrow checker would reject it. `move` tells the compiler: "this closure owns these values now."
-
-### What `tokio::spawn` returns
-
-It returns a `JoinHandle`, which is deliberately ignored here with no `let` binding. The task runs independently -- "fire and forget." The stream (via `rx`) is the only connection back to the caller.
-
----
-
-## UUID-Based Job Isolation
+### UUID-Based Job Isolation
 
 ```rust
 let job_id = uuid::Uuid::new_v4().to_string();
@@ -165,161 +310,153 @@ let working_dir = Path::new("scratch").join(&job_id);
 
 Each job gets a unique directory under `scratch/` (e.g., `scratch/a1b2c3d4-...`). This prevents concurrent jobs from overwriting each other's files.
 
-### `Path::new("scratch").join(&job_id)`
+### Error Handling Split
 
-- `Path::new("scratch")` creates a borrowed `&Path` from a string literal.
-- `.join(&job_id)` appends the UUID as a subdirectory, returning an owned `PathBuf`. On Unix this produces `scratch/a1b2c3d4-...`, on Windows `scratch\a1b2c3d4-...`.
-
----
-
-## `if let` -- Pattern Matching for Single Variants
-
-```rust
-if let Err(e) = fs::create_dir_all(&working_dir).await {
-    let _ = tx.send(Err(Status::internal(format!("Failed to create workspace: {}", e)))).await;
-    return;
-}
-```
-
-`if let` is syntactic sugar for a `match` with only one arm you care about. This reads: "if the result is an `Err`, bind the error to `e` and run this block; otherwise, keep going."
-
-The equivalent `match` would be:
-
-```rust
-match fs::create_dir_all(&working_dir).await {
-    Err(e) => {
-        let _ = tx.send(Err(Status::internal(...))).await;
-        return;
-    }
-    Ok(_) => {} // do nothing, continue
-}
-```
-
-### `let _ = tx.send(...).await`
-
-The `let _ =` pattern explicitly **discards** the result. `tx.send()` returns `Result<(), SendError>` -- it fails if the receiver was dropped (client disconnected). In this fire-and-forget context, there's nothing useful to do if the send fails, so the error is silently dropped. The `_` tells the compiler "I know I'm ignoring this, don't warn me."
-
-### `return` inside a spawned task
-
-The `return` exits the **async block**, not `execute_code`. Since this code is inside `tokio::spawn(async move { ... })`, `return` ends the background task early -- like a short-circuit on error.
+`run_job` returns `anyhow::Result<()>`. Errors from `run_job` represent **internal failures** (e.g., couldn't spawn `nvcc`). These are sent to the client as error messages and logged. Compile failures and execution errors are handled *inside* `run_job` as informational stream messages rather than propagated errors — distinguishing "the pipeline broke" from "the user's code didn't compile."
 
 ---
 
-## `cfg!(windows)` -- Compile-Time Platform Detection
+## `run_job` — The Full Pipeline
+
+```rust
+async fn run_job(
+    tx: &mpsc::Sender<Result<ComputeResponse, Status>>,
+    req: ComputeRequest,
+    working_dir: &Path,
+) -> anyhow::Result<()>
+```
+
+`run_job` owns the compile-and-execute pipeline. Using `?` for infrastructure failures keeps each step flat — compare the old deeply-nested `match` blocks to the current linear sequence.
+
+### Step 1: Create the Workspace
+
+```rust
+fs::create_dir_all(working_dir).await.context("Failed to create workspace")?;
+```
+
+Creates the UUID-named scratch directory. `anyhow::Context` enriches the error: if the `?` fires, the message "Failed to create workspace" is prepended to the OS error, giving the client a readable explanation.
+
+### Step 2: Detect Multi-File Mode
 
 ```rust
 let bin_name = if cfg!(windows) { "app.exe" } else { "app.out" };
+let is_multi_file = req.files.len() > 1;
 ```
 
-`cfg!(windows)` is a **compile-time macro** that evaluates to `true` or `false` based on the target platform. The compiler replaces this with a constant boolean -- there's zero runtime cost. On a Linux/macOS build, this compiles to just `let bin_name = "app.out";`.
+`cfg!(windows)` is a **compile-time macro** that evaluates to a constant boolean — zero runtime cost. On a Linux build, this compiles to `let bin_name = "app.out"`.
 
-This is different from `#[cfg(windows)]` (attribute form), which conditionally *includes or excludes* code. The `cfg!()` macro form always compiles both branches but evaluates the condition.
+`is_multi_file` must be derived **before** `req.files` is moved into `prepare_workspace`. Since `HashMap` does not implement `Copy`, the value can only be used once after a move — computing the count first avoids a borrow-after-move error.
 
----
-
-## `tokio::process::Command` -- Async Process Execution
+### Step 3: Reconstruct the File Tree
 
 ```rust
-let compile_status = Command::new("nvcc")
-    .arg(&file_path)
-    .args(&req.compiler_flags)
-    .arg("-o")
-    .arg(&bin_path)
-    .current_dir(&working_dir)
-    .status()
-    .await;
+utils::prepare_workspace(working_dir, req.files).await.context("Failed to prepare workspace")?;
 ```
 
-This is the **builder pattern** -- each method returns `&mut Command`, allowing chained calls.
+`prepare_workspace` (in `utils.rs`) iterates the `files` map and writes each entry to its relative path within `working_dir`, creating intermediate directories as needed. This reconstructs the exact directory structure from the client, so `#include "include/utils.cuh"` resolves correctly inside the scratch workspace.
 
-| Method | Purpose |
-|---|---|
-| `Command::new("nvcc")` | Creates a new command for the `nvcc` CUDA compiler. |
-| `.arg(&file_path)` | Adds a single argument (the source file). |
-| `.args(&req.compiler_flags)` | Adds multiple arguments from a `Vec<String>` (e.g., `["-arch=sm_80", "-O3"]`). |
-| `.arg("-o").arg(&bin_path)` | Sets the output binary path. |
-| `.current_dir(&working_dir)` | Sets the working directory for the child process. |
-| `.status()` | Spawns the process and waits for it to finish, returning `io::Result<ExitStatus>`. |
-| `.await` | Yields the Tokio task while waiting -- other tasks can run on this thread. |
-
-### `.status()` vs `.output()`
-
-- `.status()` (line 47) -- waits for the process to finish, returns only the exit code. Used for compilation where we just need pass/fail.
-- `.output()` (line 57) -- waits for the process and **captures all stdout and stderr** into memory. Used for execution where we need the program's output.
-
----
-
-## Match with Guard: `Ok(s) if s.success()`
+### Step 4: Compile with NVCC
 
 ```rust
-match compile_status {
-    Ok(s) if s.success() => {
-        // compilation succeeded
-    }
-    _ => {
-        // anything else: compile error, or nvcc not found
-    }
+let compile_output = utils::build_nvcc_command(
+    &req.entry_point_file,
+    &req.compiler_flags,
+    is_multi_file,
+    bin_name,
+)
+.current_dir(working_dir)
+.output()
+.await
+.context("Failed to spawn nvcc")?;
+```
+
+`build_nvcc_command` (in `utils.rs`) constructs an `AsyncCommand` for `nvcc`. The caller then sets the working directory and awaits the output. Using `.output()` (rather than `.status()`) captures both `stdout` and `stderr` — the full compiler diagnostics are streamed back to the client regardless of whether compilation succeeded.
+
+#### Why `.output()` for Compilation?
+
+`.status()` only returns the exit code; `.output()` also captures the compiler's messages. Since `nvcc` can emit useful warnings even on success, and detailed errors on failure, sending the full output is essential for the developer feedback loop.
+
+#### Multi-File: `-rdc=true`
+
+When `is_multi_file` is `true`, `build_nvcc_command` automatically appends `-rdc=true` (Relocatable Device Code). Without this flag, `nvcc` refuses to link device code across multiple translation units — CUDA kernels in one `.cu` file could not be called from another.
+
+### Step 5: Handle Compile Result
+
+```rust
+send_output(tx, u8_to_string(&compile_output.stdout), false).await;
+
+if !compile_output.status.success() {
+    send_output(tx, format!("❌ Compilation failed. Full error:\n{}", ...), true).await;
+    return Ok(()); // Not an internal error; the user's code failed to compile
 }
 ```
 
-This is a **match arm with a guard clause**. The arm `Ok(s) if s.success()` matches only when:
+A non-zero compiler exit code is not an `anyhow` error — it's an expected outcome (bad user code). The pipeline returns `Ok(())` after streaming the diagnostic, avoiding a spurious "Internal error:" prefix on the client.
 
-1. The `Result` is `Ok` (nvcc was found and ran), **AND**
-2. The exit status indicates success (exit code 0).
+### Step 6: Execute the Binary
 
-If nvcc returned a non-zero exit code (compilation error), `s.success()` is `false`, so it falls through to the `_` wildcard arm. If nvcc wasn't found at all, the `Result` is `Err`, which also doesn't match `Ok(s)`.
+```rust
+let exec_future = AsyncCommand::new(working_dir.join(bin_name))
+    .current_dir(working_dir)
+    .output();
 
-The `_` wildcard matches everything else -- it's the "catch-all" default case.
+match timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS), exec_future).await {
+    Ok(Ok(exec_output)) => { ... }
+    Ok(Err(e)) => send_output(tx, format!("❌ Execution failed: {}", e), true).await,
+    Err(_) => send_output(tx, "⏱️ Execution timed out. Process killed.".into(), true).await,
+}
+```
+
+The compiled binary runs with the working directory set to `working_dir`, so any relative file I/O in user code resolves correctly within the scratch workspace.
+
+`timeout` wraps the execution future. If the timer fires first, the execution future is **dropped** — dropping a `tokio::process` output future kills the child process, ensuring no zombie CUDA kernels linger in GPU memory. The three-arm `match` covers the full outcome space:
+
+| Outcome | Meaning |
+|---|---|
+| `Ok(Ok(output))` | Binary ran and exited (stdout/stderr forwarded to client) |
+| `Ok(Err(e))` | Binary failed to launch (permission denied, not an ELF, etc.) |
+| `Err(_)` | Timeout — binary was still running after `EXECUTION_TIMEOUT_SECS` seconds |
 
 ---
 
-## `String::from_utf8_lossy` -- Safe Byte-to-String Conversion
+## `utils.rs` — Platform Utilities
 
-```rust
-let stdout = String::from_utf8_lossy(&out.stdout);
-let stderr = String::from_utf8_lossy(&out.stderr);
-```
+### `find_msvc_x64_bin`
 
-Process output (`out.stdout`, `out.stderr`) is raw bytes (`Vec<u8>`), not guaranteed UTF-8. `from_utf8_lossy` converts bytes to a string, replacing any invalid UTF-8 sequences with the Unicode replacement character `U+FFFD` (�). This is "lossy" because information can be lost, but it never panics.
+Dynamically locates the MSVC x64 compiler toolchain on Windows by:
 
-It returns `Cow<str>` (Copy on Write) -- if the bytes are already valid UTF-8, it borrows them (zero-copy). If replacement was needed, it allocates a new `String`. The `.to_string()` on line 65 forces it into an owned `String` either way.
+1. Running `vswhere.exe` (checking its standard hidden path first, then `PATH`).
+2. Parsing the JSON output to get the Visual Studio installation root.
+3. Traversing `VC/Tools/MSVC/` to find the highest-versioned toolset directory.
+4. Returning the path to `bin/Hostx64/x64/` containing `cl.exe`.
 
----
+This avoids hardcoding version-specific paths that break every time Visual Studio updates. On non-Windows platforms the function returns `None` (no `vswhere` exists).
 
-## `.into()` -- The `From`/`Into` Conversion
+### `get_nvidia_status`
 
-```rust
-ComputeResponse { output: "🚀 Compilation successful. Running...".into(), is_error: false }
-```
+Shells out to `nvidia-smi` with `--query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits` and parses the comma-separated result into the five `GpuStatus` fields. Returns `None` if `nvidia-smi` is not installed or the output format is unexpected.
 
-`.into()` calls the `Into` trait to convert a `&str` literal into a `String`. This works because the standard library implements `From<&str> for String`. It's shorthand for `String::from("...")` or `.to_string()`.
+### `build_nvcc_command`
 
-The protobuf-generated `ComputeResponse` struct expects `output: String`, so `.into()` performs the conversion inline.
+A pure command-builder (no I/O) that returns a configured `AsyncCommand`. Responsibilities:
 
----
+- Injects `-ccbin <path>` on Windows via `find_msvc_x64_bin`.
+- Sets the entry point file and `-I.` (local headers discoverable by `nvcc`).
+- Appends user-supplied compiler flags.
+- Appends `-rdc=true` for multi-file projects.
+- Sets `-o <bin_name>`.
 
-## Cleanup: `fs::remove_dir_all`
+The caller controls `.current_dir()` and `.output()` / `.spawn()`, keeping this function focused and testable.
 
-```rust
-let _ = fs::remove_dir_all(&working_dir).await;
-println!("🧹 Cleaned up job {}", job_id);
-```
+### `prepare_workspace`
 
-Deletes the entire job directory (source file + compiled binary) asynchronously. The `let _ =` discards any error -- if cleanup fails (e.g., permission issue), the server continues running. This is acceptable for an MVP; production code might log the error.
+Iterates the `files: HashMap<String, String>` received from the client. For each entry:
 
----
+1. Joins the key (relative path) onto `working_dir`.
+2. Creates any intermediate parent directories with `fs::create_dir_all`.
+3. Writes the file content with `fs::write`.
 
-## The Return: Wiring `rx` into the gRPC Stream
-
-```rust
-Ok(Response::new(ReceiverStream::new(rx)))
-```
-
-This line runs **immediately** after `tokio::spawn` -- it doesn't wait for the background task to finish. It wraps the channel receiver (`rx`) in a `ReceiverStream`, which implements tonic's `Stream` trait, and returns it as the gRPC response.
-
-Tonic then polls this stream, sending each `ComputeResponse` to the client as it arrives through the channel. When the background task finishes and `tx` is dropped, the stream ends naturally -- the client sees the end of the stream.
-
-This is the core of the **server-side streaming** pattern: return the stream handle immediately, populate it asynchronously from a background task.
+This reconstructs the exact directory tree of the client's project inside the scratch workspace, preserving all relative `#include` paths.
 
 ---
 
@@ -328,128 +465,56 @@ This is the core of the **server-side streaming** pattern: return the stream han
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse()?;
-    let executor = HostExecutor;
+```
 
-    fs::create_dir_all("scratch").await?;
+`#[tokio::main]` is a procedural macro that wraps the function body in a `tokio::runtime::Runtime::block_on()` call, turning it into a synchronous entry point. It initializes the multi-threaded Tokio scheduler.
 
-    println!("🦀 Ferris-Compute-Cuda Host listening on {}", addr);
+### Pre-flight Check (Windows Only)
 
-    Server::builder()
-        .add_service(CudaExecutorServer::new(executor))
-        .serve(addr)
-        .await?;
-
-    Ok(())
+```rust
+if cfg!(windows) {
+    if let Some(path) = utils::find_msvc_x64_bin() {
+        println!("✅ Environment Check: MSVC x64 detected at {:?}", path);
+    } else {
+        eprintln!("❌ Environment Error: MSVC x64 compiler (cl.exe) not found.");
+        std::process::exit(1);
+    }
 }
 ```
 
-### `"[::1]:50051".parse()?`
+Fails fast on Windows if the MSVC toolchain is missing. Better to exit with a clear message at startup than to fail silently on the first job.
 
-The `.parse()` method calls the `FromStr` trait to convert a string into a `SocketAddr`. `[::1]` is the IPv6 loopback address (equivalent to `127.0.0.1` in IPv4). Port `50051` is the conventional default for gRPC servers. The `?` propagates the error if the string is not a valid address.
-
-### `fs::create_dir_all("scratch").await?`
-
-Ensures the base `scratch/` directory exists before the server starts accepting jobs. This uses `tokio::fs` (async) and propagates errors with `?` -- if the directory can't be created (e.g., permission denied), the server exits immediately with a clear error rather than failing silently on the first job.
-
-### `Server::builder()` -- The gRPC Server
-
-This uses the **builder pattern** to configure and start the tonic gRPC server:
-
-| Method | Purpose |
-|---|---|
-| `Server::builder()` | Creates a new server configuration. |
-| `.add_service(CudaExecutorServer::new(executor))` | Registers the `HostExecutor` implementation as the handler for the `CUDAExecutor` gRPC service. `CudaExecutorServer` is the auto-generated wrapper from protobuf that routes incoming RPCs to the trait methods. |
-| `.serve(addr).await?` | Binds to the address and starts listening. This **blocks forever** (awaits indefinitely) until the server is shut down or an error occurs. |
-
-### Why `Server::builder().serve()` never returns
-
-`.serve(addr).await` is an infinite loop that accepts connections and dispatches requests. The `Ok(())` at the end of `main` is only reached if the server is explicitly shut down (e.g., via a signal handler). In practice, you stop the host with `Ctrl+C`.
-
----
-
-## Async `.await` -- A Complete Reference
-
-`.await` is a language keyword (not a method) that can only appear inside `async` functions or blocks. It pauses the current task, yields control back to the Tokio scheduler so other tasks can run, and resumes when the result is ready.
-
-### Categories of `.await` in this File
-
-#### File I/O (`tokio::fs`)
-
-Non-blocking wrappers around `std::fs`. Tokio runs the actual I/O on a dedicated blocking thread pool.
+### Configuration Loading
 
 ```rust
-fs::create_dir_all("scratch").await?;           // line 105: create directory at startup
-fs::create_dir_all(&working_dir).await          // line 28:  create job workspace
-fs::write(&file_path, &req.source_code).await;  // line 39:  write CUDA source to disk
-fs::remove_dir_all(&working_dir).await;         // line 91:  delete job directory
+let _ = dotenvy::dotenv();  // load .env file; ignore error if file absent
+let args = HostArgs::parse();
 ```
 
-Each yields while the OS performs the disk operation.
+`dotenvy::dotenv()` loads key-value pairs from a `.env` file (if present) into the process environment **before** `clap` parses arguments. This is why the `env = "FERRIS_AUTH_TOKEN"` attribute on `HostArgs` works with a `.env` file.
 
-#### Process Execution (`tokio::process::Command`)
-
-Spawns child processes without blocking the runtime thread.
+### Server Binding
 
 ```rust
-Command::new("nvcc").arg(...).status().await;   // line 41-49: wait for exit code only
-Command::new(&bin_path).output().await;         // line 59-62: wait and capture all output
+let addr = "0.0.0.0:50051".parse()?;
 ```
 
-| Method | Returns | Captures output? | Use case |
-|---|---|---|---|
-| `.status().await` | `io::Result<ExitStatus>` | No | When you only need pass/fail (compilation) |
-| `.output().await` | `io::Result<Output>` | Yes (stdout + stderr) | When you need the program's output (execution) |
+`0.0.0.0` binds to **all network interfaces**, making the host reachable from any machine on the network (not just localhost). This is the correct choice for a remote GPU server. `50051` is the conventional default gRPC port.
 
-#### Channel Send (`tokio::sync::mpsc`)
+### Auth Interceptor Registration
 
 ```rust
-tx.send(Ok(ComputeResponse { ... })).await;     // lines 29, 53-56, 69-72, 75-78, 83-86
+let service = CudaExecutorServer::with_interceptor(executor, move |req| {
+    let token_to_verify = args.token.clone();
+    check_auth(req, token_to_verify)
+});
 ```
 
-Puts a message into the bounded channel. Only yields if the buffer is full (all 100 slots occupied) -- pauses until the receiver consumes a message. If the receiver has been dropped (client disconnected), returns `Err` immediately.
+`with_interceptor` wraps the executor with `check_auth`. The closure must be `FnMut` (callable multiple times), so it `.clone()`s the token on each invocation, passing a fresh owned copy to `check_auth` while retaining the original for subsequent calls.
 
-#### gRPC Server (`tonic`)
+### `Server::builder().serve(addr).await?`
 
-```rust
-Server::builder()
-    .add_service(CudaExecutorServer::new(executor))
-    .serve(addr)
-    .await?;                                     // line 110-113
-```
-
-Enters an infinite accept loop. This `.await` never resolves during normal operation -- it permanently yields, handling requests as they arrive. The server is stopped with `Ctrl+C`.
-
-### The `while let Some(...) = stream.message().await?` Pattern
-
-On the client side, this is the idiomatic Rust pattern for consuming a gRPC stream:
-
-```rust
-while let Some(response) = stream.message().await? {
-    // process response
-}
-```
-
-`.message()` returns `Result<Option<ComputeResponse>, Status>`. The full sequence per iteration:
-
-1. `stream.message()` -- creates a future (not yet running)
-2. `.await` -- yields the task until the server sends a message or closes the stream
-3. `?` -- if `Err(status)`, return the error; if `Ok(option)`, unwrap the `Result`
-4. `while let Some(response)` -- if `Some`, bind to `response` and enter loop body; if `None`, break
-
-This is Rust's equivalent of `for await (const msg of stream)` in JavaScript or `stream.Recv()` in a Go loop.
-
-### Protobuf-to-Rust Name Mapping
-
-`tonic-build` automatically converts Protobuf's PascalCase to Rust's snake_case:
-
-| Protobuf | Generated Rust | Convention |
-|---|---|---|
-| `service CUDAExecutor` | `mod cuda_executor_server` / `mod cuda_executor_client` | snake_case modules |
-| `rpc ExecuteCode(...)` | `fn execute_code(...)` | snake_case function |
-| `message ComputeRequest` | `struct ComputeRequest` | PascalCase (unchanged -- already Rust convention) |
-
-So `client.execute_code(request)` in the client maps to protobuf's `ExecuteCode` RPC, which dispatches to the trait method `execute_code` on `HostExecutor`.
+Binds to the address and enters an infinite accept loop. This `.await` never resolves during normal operation — the server is stopped with `Ctrl+C` or a process signal.
 
 ---
 
@@ -457,36 +522,74 @@ So `client.execute_code(request)` in the client maps to protobuf's `ExecuteCode`
 
 ### Server Startup
 
-1. **Parse address** -- `"[::1]:50051"` is parsed into a `SocketAddr`.
-2. **Create executor** -- instantiate the zero-sized `HostExecutor`.
-3. **Ensure scratch directory** -- create `scratch/` if it doesn't exist.
-4. **Start gRPC server** -- bind to the port and listen for incoming connections.
+```
+main()
+  ├── Pre-flight: check MSVC on Windows (exit 1 if missing)
+  ├── dotenvy: load .env into process env
+  ├── clap: parse --token / FERRIS_AUTH_TOKEN
+  ├── create scratch/ directory
+  ├── register check_auth interceptor
+  └── Server::builder().serve("0.0.0.0:50051") ──► listen forever
+```
 
-### Per-Job Pipeline (inside `execute_code`)
+### Per-Job Pipeline
 
-1. **Receive request** -- tonic decodes the gRPC call into a `ComputeRequest`.
-2. **Create channel** -- `mpsc::channel(100)` for communication between the background task and the stream.
-3. **Spawn background task** -- `tokio::spawn` starts the compilation pipeline without blocking.
-4. **Return stream immediately** -- the client starts listening before any work is done.
-5. **Create workspace** -- UUID-named directory under `scratch/` for job isolation.
-6. **Write source file** -- async write of the CUDA source code to disk.
-7. **Compile** -- run `nvcc` asynchronously, check exit status.
-8. **Execute** -- if compilation succeeded, run the binary and capture output.
-9. **Stream results** -- send stdout/stderr through the channel to the client.
-10. **Cleanup** -- delete the job directory.
-11. **Stream ends** -- when the task finishes, `tx` is dropped, closing the channel and ending the gRPC stream.
+```
+execute_code() ──► returns stream immediately
+    │
+    ├── request.into_inner()         extract ComputeRequest
+    ├── mpsc::channel(100)           create tx/rx pair
+    ├── tokio::spawn(async move)     fire background task
+    │       │
+    │       └── run_job(&tx, req, working_dir)
+    │               │
+    │               ├── 1. create_dir_all(working_dir)          ?
+    │               ├── 2. is_multi_file = files.len() > 1
+    │               ├── 3. prepare_workspace(working_dir, files) ?
+    │               ├── 4. build_nvcc_command(...).output()      ?
+    │               │       ├── stream compiler stdout
+    │               │       └── on failure: stream error, return Ok(())
+    │               ├── 5. stream "🚀 Compilation successful..."
+    │               └── 6. timeout(binary execution)
+    │                       ├── Ok: stream stdout / stderr
+    │                       ├── exec error: stream error message
+    │                       └── timeout: stream timeout message
+    │
+    ├── on Err from run_job: stream "❌ Internal error: ..."
+    ├── fs::remove_dir_all(working_dir)   cleanup
+    └── tx dropped ──► ReceiverStream ends ──► gRPC stream closes ──► client sees EOF
+```
 
 ---
 
-## Resource Limits (Timeouts)
+## `.await` Reference
 
-To ensure system stability, the engine enforces a "Time-to-Live" (TTL) for every GPU kernel execution.
+`.await` is a language keyword (not a method) that can only appear inside `async` functions or blocks. It pauses the current task, yields control to the Tokio scheduler, and resumes when the result is ready.
 
-### Timeout Guard
+### Categories in This Codebase
 
-The execution of the compiled binary is wrapped in a `tokio::time::timeout`.
+| Expression | Type | Effect |
+|---|---|---|
+| `fs::create_dir_all(...).await` | File I/O | Offloads blocking disk I/O to Tokio's thread pool |
+| `fs::write(...).await` | File I/O | Same as above |
+| `fs::remove_dir_all(...).await` | File I/O | Same as above |
+| `cmd.output().await` | Process | Spawns child process; yields until it exits |
+| `timeout(dur, future).await` | Timer race | Yields until future completes OR timer fires |
+| `tx.send(...).await` | Channel | Yields only if the 100-item buffer is full |
+| `Server::...serve(addr).await` | Accept loop | Yields indefinitely; handles each request |
 
-1. **The Future Race:** The engine polls the execution future and a timer future simultaneously.
-2. **Expiry:** If the timer expires first, the execution future is dropped.
-3. **Process Cleanup:** Dropping a `tokio::process::Child` (via the command's output future) automatically kills the child process, ensuring no "zombie" CUDA kernels remain in GPU memory.
-4. **Communication:** A specific timeout message is sent back through the gRPC stream to inform the user.
+### `while let Some(...) = stream.message().await?` (Client Side)
+
+The idiomatic Rust pattern for consuming a gRPC server-streaming response:
+
+```rust
+while let Some(response) = stream.message().await? {
+    // process response
+}
+```
+
+`.message()` returns `Result<Option<ComputeResponse>, Status>`. Per iteration:
+
+1. `.await` — yields until the server sends a message or closes the stream.
+2. `?` — if `Err(status)`, propagate the error; if `Ok(option)`, unwrap the `Result`.
+3. `while let Some(response)` — if `Some`, enter the loop body; if `None`, the stream is closed and the loop exits.
