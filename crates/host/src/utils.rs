@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command as SyncCommand;
+use tokio::fs;
+use anyhow::Context; // Adds the .context() method to Results
+use std::collections::HashMap;
 
 /// Dynamically locates the Microsoft Visual C++ (MSVC) x64 compiler toolchain.
 ///
@@ -104,4 +107,26 @@ pub async fn get_nvidia_status() -> Option<(String, u32, u32, u32, u32)> {
     } else {
         None
     }
+}
+
+/// Reconstructs the uploaded files into the provided working directory
+pub async fn prepare_workspace(
+    working_dir: &Path, 
+    files: HashMap<String, String>
+) -> anyhow::Result<()> {
+    for (name, content) in files {
+        let file_path = working_dir.join(&name);
+        
+        // Handle nested directories
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .context(format!("Failed to create subdirectory: {:?}", parent))?;
+        }
+        
+        fs::write(&file_path, content)
+            .await
+            .context(format!("Failed to write file content to: {:?}", file_path))?;
+    }
+    Ok(())
 }

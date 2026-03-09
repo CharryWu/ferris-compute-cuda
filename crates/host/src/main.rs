@@ -84,111 +84,93 @@ impl CudaExecutor for HostExecutor {
         tokio::spawn(async move {
             let job_id = uuid::Uuid::new_v4().to_string();
             let working_dir = Path::new("scratch").join(&job_id);
-
-            // 1. Create temporary workspace
+            
+            // 1. Create temporary workspace and reconstruct directory tree
             if let Err(e) = fs::create_dir_all(&working_dir).await {
-                let _ = tx
-                    .send(Err(Status::internal(format!(
-                        "Failed to create workspace: {}",
-                        e
-                    ))))
-                    .await;
+                let _ = tx.send(Err(Status::internal(format!("Failed to create workspace: {}", e)))).await;
                 return;
             }
 
-            let file_path = working_dir.join(&req.file_name);
             // Platform agnostic binary extension
             let bin_name = if cfg!(windows) { "app.exe" } else { "app.out" };
+            let is_multi_file = req.files.len() > 1;
 
-            // 2. Write source code
-            let _ = fs::write(&file_path, &req.source_code).await;
+            // Move the file reconstruction to utils to handle the map of files
+            if let Err(e) = utils::prepare_workspace(&working_dir, req.files).await {
+                // keep the gRPC stream alive even on setup errors
+                send_output(&tx, format!("❌ Failed to prepare workspace: {}", e), true).await;
+                let _ = fs::remove_dir_all(&working_dir).await;
+                return;
+            }
 
-            // 3. Compile with NVCC - ensure we use the correct x64 MSVC compiler if on Windows
+            // 2. Compile with NVCC
             let mut cmd = AsyncCommand::new("nvcc");
 
+            // Discovery of MSVC toolchain for Windows
             if let Some(ccbin) = utils::find_msvc_x64_bin() {
                 cmd.arg("-ccbin").arg(ccbin);
             }
 
+            // Setup base compilation arguments
+            cmd.arg(&req.entry_point_file)
+               .arg("-I.") // Ensure local headers are discoverable
+               .args(&req.compiler_flags);
+
+            // Automatically enable Relocatable Device Code for multi-file projects
+            if is_multi_file {
+                cmd.arg("-rdc=true");
+            }
+
             let compile_result = cmd
-                .arg(&req.file_name)
-                .args(&req.compiler_flags)
                 .arg("-o")
                 .arg(bin_name)
                 .current_dir(&working_dir)
-                .output() // don't use .status() since it doesn't capture compiler stdout/stderr
+                .output()
                 .await;
 
             match compile_result {
                 Ok(compile_output) => {
-                    // Capture compiler output and stream back to client
                     let compiler_stdout = u8_to_string(&compile_output.stdout);
                     let compiler_stderr = u8_to_string(&compile_output.stderr);
 
-                    // Stream compiler output back to client in real-time (if any)
-                    // The capturing & sending must happen before checking the status
-                    // otherwise nothing will be captured
                     send_output(&tx, compiler_stdout, false).await;
-                    if !compiler_stderr.is_empty() {
+                    
+                    if !compile_output.status.success() {
                         send_output(
                             &tx,
                             format!("❌ Compilation failed. Full error:\n{}", compiler_stderr),
                             true,
-                        )
-                        .await;
-                    }
-                    // Only proceed to execution if compilation succeeded
-                    if compile_output.status.success() {
-                        send_output(
-                            &tx,
-                            "🚀 Compilation successful. Running binary...".into(),
-                            false,
-                        )
-                        .await;
+                        ).await;
+                    } else {
+                        send_output(&tx, "🚀 Compilation successful. Running binary...".into(), false).await;
 
                         let bin_path = working_dir.join(bin_name);
-                        // 4. Execute the binary
+                        
+                        // 3. Execute the binary
                         let exec_future = AsyncCommand::new(bin_path)
                             .current_dir(&working_dir)
                             .output();
 
-                        // Set a timeout for execution to prevent hanging processes
-                        match timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS), exec_future)
-                            .await
-                        {
+                        match timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS), exec_future).await {
                             Ok(Ok(exec_output)) => {
-                                let exec_stdout = u8_to_string(&exec_output.stdout);
-                                let exec_stderr = u8_to_string(&exec_output.stderr);
-
-                                // Capture execution output and stream back to client
-                                send_output(&tx, exec_stdout, false).await;
-                                send_output(&tx, exec_stderr, true).await;
+                                send_output(&tx, u8_to_string(&exec_output.stdout), false).await;
+                                send_output(&tx, u8_to_string(&exec_output.stderr), true).await;
                             }
                             Ok(Err(e)) => {
                                 send_output(&tx, format!("❌ Execution failed: {}", e), true).await;
                             }
                             Err(_) => {
-                                send_output(
-                                    &tx,
-                                    "⏱️ Execution timed out after 30 seconds. Process killed."
-                                        .into(),
-                                    true,
-                                )
-                                .await;
+                                send_output(&tx, "⏱️ Execution timed out. Process killed.".into(), true).await;
                             }
                         }
                     }
                 }
                 _ => {
-                    send_output(
-                        &tx,
-                        "❌ Compilation failed. Internal error occurred.".into(),
-                        true,
-                    )
-                    .await;
+                    send_output(&tx, "❌ Compilation failed. Internal error occurred.".into(), true).await;
                 }
             }
 
+            // 4. Cleanup
             let _ = fs::remove_dir_all(&working_dir).await;
             println!("🧹 Cleaned up job {}", job_id);
         });

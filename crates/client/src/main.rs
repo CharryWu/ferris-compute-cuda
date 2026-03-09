@@ -3,15 +3,17 @@ use clap::{Parser};
 use colored::*;
 use common::compute::ComputeRequest;
 use common::compute::cuda_executor_client::CudaExecutorClient;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(name = "ferris-run", about = "Remote CUDA Execution Tool")]
 pub enum Args {
     /// Execute a CUDA file on the remote host
     Run {
-        /// Path to the .cu file
-        file: PathBuf,
+        /// Paths to .cu/.cuh/.h/.cpp files or directories containing them
+        /// Supports multiple files and directories
+        inputs: Vec<PathBuf>,
 
         /// Remote host address (e.g., http://192.168.1.50:50051)
         #[arg(short, long, default_value = "http://[::1]:50051")]
@@ -36,74 +38,120 @@ pub enum Args {
     },
 }
 
+/// Recursively gathers valid CUDA/C++ files from a path (file or directory)
+fn gather_files_recursive(
+    base_dir: &Path,
+    current_path: &Path,
+    files_map: &mut HashMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const ALLOWED_EXTENSIONS: [&str; 6] = ["cu", "cuh", "ptx", "cubin", "h", "cpp"];
 
-async fn handle_run(file: PathBuf, server: String, flags: Vec<String>, token: String) -> Result<(), Box<dyn std::error::Error>> {
-    
-    // 3. Read the local CUDA file
-    let source_code = std::fs::read_to_string(&file)
-        .map_err(|e| format!("Could not read file {}: {}", file.display(), e))?;
+    if current_path.is_dir() {
+        for entry in std::fs::read_dir(current_path)? {
+            gather_files_recursive(base_dir, &entry?.path(), files_map)?;
+        }
+    } else {
+        let extension = current_path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
 
-    // 4. Validate file extension
-    let file_name = file
+        if ALLOWED_EXTENSIONS.contains(&extension.as_str()) {
+            let content = std::fs::read_to_string(current_path)
+                .map_err(|e| format!("Could not read file {}: {}", current_path.display(), e))?;
+            
+            // Reconstruct relative path for the Host (e.g., "src/kernel.cu")
+            let relative_path = current_path
+                .strip_prefix(base_dir)
+                .unwrap_or(current_path)
+                .to_string_lossy()
+                .into_owned();
+            
+            files_map.insert(relative_path, content);
+        }
+    }
+    Ok(())
+}
+
+async fn handle_run(
+    inputs: Vec<PathBuf>, 
+    server: String, 
+    flags: Vec<String>, 
+    token: String
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut files = HashMap::new();
+
+    // 1. Gather all files from all provided inputs (files or directories)
+    for input in &inputs {
+        // If input is a file, the "base" is its parent so the file itself is gathered.
+        // If input is a directory, the directory itself is the base.
+        let base: &Path = if input.is_dir() {
+            input.as_path()
+        } else {
+            input.parent().unwrap_or(Path::new("."))
+        };
+        gather_files_recursive(base, input, &mut files)?;
+    }
+
+    if files.is_empty() {
+        eprintln!("{}", "❌ Error: No valid CUDA/C++ files found in provided inputs.".red());
+        std::process::exit(1);
+    }
+
+    // 2. Identify Entry Point (the first path provided by the user)
+    let entry_file = inputs[0]
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
-    const ALLOWED_EXTENSIONS: [&str; 4] = ["cu", "cuh", "ptx", "cubin"];
-    let extension = file
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
-        .to_lowercase();
+    // 3. Mode Detection & Acknowledgment
+    let is_multi = files.len() > 1;
+    let mode_tag = if is_multi {
+        format!("📂 {}", "Multi-file Workspace".bold().cyan())
+    } else {
+        format!("📄 {}", "Single-file Mode".bold().green())
+    };
 
-    if !ALLOWED_EXTENSIONS.contains(&extension.as_str()) {
-        eprintln!(
-            "❌ Validation Error: Unsupported file extension '.{}'",
-            extension
-        );
-        eprintln!("Supported types: {:?}", ALLOWED_EXTENSIONS);
-        std::process::exit(1);
-    }
-
-    ///////// CONNECTION /////////
+    println!("{} Mode: {}", "🚀".bold(), mode_tag);
     println!(
         "{} Connecting to host at {}...",
-        "🚀".bold(),
+        "📡".bold(),
         server.cyan()
     );
 
-    // 1. Connect to the host
-    let mut client = CudaExecutorClient::connect(server).await?;
+    // 4. Connect and Prepare Request
+    let mut client = CudaExecutorClient::connect(server.clone()).await?;
+    let files_len = files.len();
 
-    let mut request = tonic::Request::new(ComputeRequest {
-        source_code,
-        file_name: file_name.clone(),
+    // Note: The .proto was updated to use 'map<string, string> files' and 'string entry_point_file'
+    let mut request= tonic::Request::new(ComputeRequest {
+        files,
+        entry_point_file: entry_file.clone(),
         compiler_flags: flags,
     });
 
     println!(
-        "{} Sending {} to remote GPU...",
+        "{} Syncing {} files (Entry: {}) to remote GPU...",
         "📤".bold(),
-        file_name.yellow()
+        files_len.to_string().yellow(),
+        entry_file.yellow()
     );
 
-    // Insert the token into metadata
-    let token_value = token
-        .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()?;
+    // 5. Inject Auth Token
+    let token_value = token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()?;
     request.metadata_mut().insert("x-ferris-token", token_value);
 
-    ///////// EXECUTION RESULT DISPLAY AND ERROR HANDLING /////////
+    // 6. Execution Loop
     let response = client.execute_code(request).await;
     match response {
         Ok(res) => {
             let mut stream = res.into_inner();
             while let Some(msg) = stream.message().await? {
                 if msg.is_error {
-                    // Print compiler errors or GPU runtime error outputs in red
                     eprintln!("{}", msg.output.red());
                 } else {
-                    // Print standard output in green/white
                     println!("{}", msg.output);
                 }
             }
@@ -123,7 +171,6 @@ async fn handle_run(file: PathBuf, server: String, flags: Vec<String>, token: St
     }
 
     println!("\n{} Execution finished.", "✅".bold().green());
-
     Ok(())
 }
 
@@ -177,8 +224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     match args {
-        Args::Run { file, server, flags, token } => {
-            handle_run(file, server, flags, token).await?
+        Args::Run { inputs, server, flags, token } => {
+            handle_run(inputs, server, flags, token).await?
         }
         Args::Status { server, token } => {
             handle_status(server, token).await?

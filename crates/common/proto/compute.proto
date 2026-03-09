@@ -8,6 +8,23 @@ service CUDAExecutor {
     rpc GetGpuStatus(Empty) returns (GpuStatus);
 }
 
+message ComputeRequest {
+  // Key: The relative path of the file (e.g., "main.cu" or "include/utils.cuh")
+  // Value: The raw text content of the file
+  map<string, string> files = 1;
+  
+  // The filename that nvcc should target for the main compilation
+  string entry_point_file = 2;
+  
+  // User-provided flags (e.g., "-arch=sm_80")
+  repeated string compiler_flags = 3;
+}
+
+message ComputeResponse {
+    string output = 1; // Could be stdout, stderr, or status updates
+    bool is_error = 2;
+}
+
 message Empty {}
 
 message GpuStatus {
@@ -16,15 +33,4 @@ message GpuStatus {
     uint32 memory_used_mb = 3;
     uint32 memory_total_mb = 4;
     uint32 load_percentage = 5;
-}
-
-message ComputeRequest {
-    string source_code = 1;
-    string file_name = 2;
-    repeated string compiler_flags = 3;
-}
-
-message ComputeResponse {
-    string output = 1; // Could be stdout, stderr, or status updates
-    bool is_error = 2;
 }
