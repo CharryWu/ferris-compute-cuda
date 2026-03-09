@@ -37,11 +37,7 @@ fn check_auth(req: Request<()>, expected_token: String) -> Result<Request<()>, S
     }
 }
 
-async fn send_output(
-    tx: &mpsc::Sender<Result<ComputeResponse, Status>>,
-    output: String,
-    is_error: bool,
-) {
+async fn send_output(tx: &mpsc::Sender<Result<ComputeResponse, Status>>, output: String, is_error: bool) {
     if !output.is_empty() {
         let _ = tx.send(Ok(ComputeResponse { output, is_error })).await;
     }
@@ -84,10 +80,12 @@ impl CudaExecutor for HostExecutor {
         tokio::spawn(async move {
             let job_id = uuid::Uuid::new_v4().to_string();
             let working_dir = Path::new("scratch").join(&job_id);
-            
+
             // 1. Create temporary workspace and reconstruct directory tree
             if let Err(e) = fs::create_dir_all(&working_dir).await {
-                let _ = tx.send(Err(Status::internal(format!("Failed to create workspace: {}", e)))).await;
+                let _ = tx
+                    .send(Err(Status::internal(format!("Failed to create workspace: {}", e))))
+                    .await;
                 return;
             }
 
@@ -113,20 +111,15 @@ impl CudaExecutor for HostExecutor {
 
             // Setup base compilation arguments
             cmd.arg(&req.entry_point_file)
-               .arg("-I.") // Ensure local headers are discoverable
-               .args(&req.compiler_flags);
+                .arg("-I.") // Ensure local headers are discoverable
+                .args(&req.compiler_flags);
 
             // Automatically enable Relocatable Device Code for multi-file projects
             if is_multi_file {
                 cmd.arg("-rdc=true");
             }
 
-            let compile_result = cmd
-                .arg("-o")
-                .arg(bin_name)
-                .current_dir(&working_dir)
-                .output()
-                .await;
+            let compile_result = cmd.arg("-o").arg(bin_name).current_dir(&working_dir).output().await;
 
             match compile_result {
                 Ok(compile_output) => {
@@ -134,22 +127,21 @@ impl CudaExecutor for HostExecutor {
                     let compiler_stderr = u8_to_string(&compile_output.stderr);
 
                     send_output(&tx, compiler_stdout, false).await;
-                    
+
                     if !compile_output.status.success() {
                         send_output(
                             &tx,
                             format!("❌ Compilation failed. Full error:\n{}", compiler_stderr),
                             true,
-                        ).await;
+                        )
+                        .await;
                     } else {
                         send_output(&tx, "🚀 Compilation successful. Running binary...".into(), false).await;
 
                         let bin_path = working_dir.join(bin_name);
-                        
+
                         // 3. Execute the binary
-                        let exec_future = AsyncCommand::new(bin_path)
-                            .current_dir(&working_dir)
-                            .output();
+                        let exec_future = AsyncCommand::new(bin_path).current_dir(&working_dir).output();
 
                         match timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS), exec_future).await {
                             Ok(Ok(exec_output)) => {
@@ -187,9 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("✅ Environment Check: MSVC x64 detected at {:?}", path);
         } else {
             eprintln!("❌ Environment Error: MSVC x64 compiler (cl.exe) not found.");
-            eprintln!(
-                "Please ensure 'Desktop development with C++' is installed in Visual Studio."
-            );
+            eprintln!("Please ensure 'Desktop development with C++' is installed in Visual Studio.");
             std::process::exit(1);
         }
     }
@@ -205,10 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::create_dir_all("scratch").await?;
 
-    println!(
-        "🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)",
-        addr
-    );
+    println!("🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)", addr);
 
     // 3. Pass token into interceptor closure. We clone 'args.token' into closure
     // Use 'move' so the closure takes its own copy of 'args.token'

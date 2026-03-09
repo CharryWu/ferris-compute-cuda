@@ -151,8 +151,7 @@ async fn handle_status(server: String, token: String) -> Result<(), Box<dyn std:
     println!("📡 Querying GPU status from {}...", server);
 
     // 1. Connect to the remote Host
-    let mut client =
-        common::compute::cuda_executor_client::CudaExecutorClient::connect(server).await?;
+    let mut client = common::compute::cuda_executor_client::CudaExecutorClient::connect(server).await?;
 
     // 2. Prepare the Request with an empty body
     let mut request = tonic::Request::new(common::compute::Empty {});
