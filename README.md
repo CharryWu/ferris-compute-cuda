@@ -67,10 +67,28 @@ cargo run -p client -- run --server "http://<SERVER_IP>:50051" ./samples/hellowo
 
 # Multiple Files (supports .cu, .cuh, .cpp. .hpp, .h)
 cargo run -p client -- run --server "http://<SERVER_IP>:50051" "<ENTRY_POINT_FILE>" "<INCLUDE_FILE_1>" "<INCLUDE_FILE_2>"
-
 ```
 
 *Note: The first path provided is treated as the primary entry point.*
+
+Real example - multiple files:
+
+```bash
+cargo run -p client -- run --server "http://10.0.0.181:50051" ./samples/deep_project/main.cu ./samples/deep_project/core/wrapper.cuh ./samples/deep_project/core/math/operations.cuh ./samples/deep_project/core/math/constants.cuh
+# Equivalent to:
+cargo run -p client -- run --server "http://10.0.0.181:50051" ./samples/deep_project/main.cu ./samples/deep_project/
+```
+
+### 📂 Directory Structures
+
+When syncing a folder, **ferris-compute-cuda** maintains the internal hierarchy:
+
+```text
+Local:                     Remote NVCC Workspace on Host:
+project/                   scratch/<UUID>/
+ ├── main.cu        --->    ├── main.cu
+ └── include/               └── include/
+      └── utils.cuh              └── utils.cuh
 
 ---
 

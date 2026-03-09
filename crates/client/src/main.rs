@@ -1,10 +1,11 @@
+mod utils;
 /// This code handles the connection, file reading, and the asynchronous loop that listens to the server's stream.
-use clap::{Parser};
+use clap::Parser;
 use colored::*;
 use common::compute::ComputeRequest;
 use common::compute::cuda_executor_client::CudaExecutorClient;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "ferris-run", about = "Remote CUDA Execution Tool")]
@@ -38,73 +39,49 @@ pub enum Args {
     },
 }
 
-/// Recursively gathers valid CUDA/C++ files from a path (file or directory)
-fn gather_files_recursive(
-    base_dir: &Path,
-    current_path: &Path,
-    files_map: &mut HashMap<String, String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    const ALLOWED_EXTENSIONS: [&str; 6] = ["cu", "cuh", "ptx", "cubin", "h", "cpp"];
-
-    if current_path.is_dir() {
-        for entry in std::fs::read_dir(current_path)? {
-            gather_files_recursive(base_dir, &entry?.path(), files_map)?;
-        }
-    } else {
-        let extension = current_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default()
-            .to_lowercase();
-
-        if ALLOWED_EXTENSIONS.contains(&extension.as_str()) {
-            let content = std::fs::read_to_string(current_path)
-                .map_err(|e| format!("Could not read file {}: {}", current_path.display(), e))?;
-            
-            // Reconstruct relative path for the Host (e.g., "src/kernel.cu")
-            let relative_path = current_path
-                .strip_prefix(base_dir)
-                .unwrap_or(current_path)
-                .to_string_lossy()
-                .into_owned();
-            
-            files_map.insert(relative_path, content);
-        }
-    }
-    Ok(())
-}
-
 async fn handle_run(
-    inputs: Vec<PathBuf>, 
-    server: String, 
-    flags: Vec<String>, 
-    token: String
+    inputs: Vec<PathBuf>,
+    server: String,
+    flags: Vec<String>,
+    token: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if inputs.is_empty() {
+        return Err("No input files provided.".into());
+    }
+
     let mut files = HashMap::new();
 
-    // 1. Gather all files from all provided inputs (files or directories)
+    // 1. Establish the Global Anchor (Base Directory)
+    // We use the parent of the FIRST input (entry point) as the root of the entire sync.
+    let entry_input = inputs[0].canonicalize()?;
+    let global_base = if entry_input.is_dir() {
+        entry_input.clone()
+    } else {
+        entry_input
+            .parent()
+            .ok_or("Could not determine base directory")?
+            .to_path_buf()
+    };
+
+    // 2. Gather files using the fix Global Base
     for input in &inputs {
-        // If input is a file, the "base" is its parent so the file itself is gathered.
-        // If input is a directory, the directory itself is the base.
-        let base: &Path = if input.is_dir() {
-            input.as_path()
-        } else {
-            input.parent().unwrap_or(Path::new("."))
-        };
-        gather_files_recursive(base, input, &mut files)?;
+        let canon_path = input.canonicalize()?;
+        utils::gather_files_recursive(&global_base, &canon_path, &mut files)?;
     }
 
     if files.is_empty() {
-        eprintln!("{}", "❌ Error: No valid CUDA/C++ files found in provided inputs.".red());
+        eprintln!(
+            "{}",
+            "❌ Error: No valid CUDA/C++ files found in provided inputs.".red()
+        );
         std::process::exit(1);
     }
 
     // 2. Identify Entry Point (the first path provided by the user)
-    let entry_file = inputs[0]
-        .file_name()
-        .unwrap_or_default()
+    let entry_file = entry_input
+        .strip_prefix(&global_base)?
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
 
     // 3. Mode Detection & Acknowledgment
     let is_multi = files.len() > 1;
@@ -115,18 +92,14 @@ async fn handle_run(
     };
 
     println!("{} Mode: {}", "🚀".bold(), mode_tag);
-    println!(
-        "{} Connecting to host at {}...",
-        "📡".bold(),
-        server.cyan()
-    );
+    println!("{} Connecting to host at {}...", "📡".bold(), server.cyan());
 
     // 4. Connect and Prepare Request
     let mut client = CudaExecutorClient::connect(server.clone()).await?;
     let files_len = files.len();
 
     // Note: The .proto was updated to use 'map<string, string> files' and 'string entry_point_file'
-    let mut request= tonic::Request::new(ComputeRequest {
+    let mut request = tonic::Request::new(ComputeRequest {
         files,
         entry_point_file: entry_file.clone(),
         compiler_flags: flags,
@@ -178,7 +151,8 @@ async fn handle_status(server: String, token: String) -> Result<(), Box<dyn std:
     println!("📡 Querying GPU status from {}...", server);
 
     // 1. Connect to the remote Host
-    let mut client = common::compute::cuda_executor_client::CudaExecutorClient::connect(server).await?;
+    let mut client =
+        common::compute::cuda_executor_client::CudaExecutorClient::connect(server).await?;
 
     // 2. Prepare the Request with an empty body
     let mut request = tonic::Request::new(common::compute::Empty {});
@@ -191,12 +165,13 @@ async fn handle_status(server: String, token: String) -> Result<(), Box<dyn std:
     match client.get_gpu_status(request).await {
         Ok(response) => {
             let status = response.into_inner();
-            
+
             println!("\n--- 🖥️  Remote GPU Status ---");
             println!("Model:       {}", status.gpu_name);
             println!("Temperature: {}°C", status.temperature_celsius);
-            println!("Memory:      {} / {} MB ({:.1}%)", 
-                status.memory_used_mb, 
+            println!(
+                "Memory:      {} / {} MB ({:.1}%)",
+                status.memory_used_mb,
                 status.memory_total_mb,
                 (status.memory_used_mb as f32 / status.memory_total_mb as f32) * 100.0
             );
@@ -224,12 +199,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     match args {
-        Args::Run { inputs, server, flags, token } => {
-            handle_run(inputs, server, flags, token).await?
-        }
-        Args::Status { server, token } => {
-            handle_status(server, token).await?
-        }
+        Args::Run {
+            inputs,
+            server,
+            flags,
+            token,
+        } => handle_run(inputs, server, flags, token).await?,
+        Args::Status { server, token } => handle_status(server, token).await?,
     }
 
     Ok(())
