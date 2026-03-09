@@ -56,17 +56,17 @@ cargo run -p client -- status --server "http://<SERVER_IP>:50051"
 
 ```
 
-#### 🏃 Run CUDA Jobs
+#### 🏃 Run CUDA Code
 
 The client automatically detects if you are sending a single file or an entire project (multi-file support with directories).
 You have to supply entry point file as first file argument to the `run` subcommand:
 
 ```bash
 # Single File
-cargo run -p client -- run ./kernel.cu
+cargo run -p client -- run --server "http://<SERVER_IP>:50051" ./samples/helloworld/matrix_addition.cu
 
-# Project Sync (Recursive)
-cargo run -p client -- run . 
+# Multiple Files (supports .cu, .cuh, .cpp. .hpp, .h)
+cargo run -p client -- run --server "http://<SERVER_IP>:50051" "<ENTRY_POINT_FILE>" "<INCLUDE_FILE_1>" "<INCLUDE_FILE_2>"
 
 ```
 
