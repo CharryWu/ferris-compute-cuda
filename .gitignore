@@ -69,6 +69,7 @@ tmpxft*
 # Folders where the host builds user-submitted code
 /crates/host/scratch/
 /crates/host/build_artifacts/
+/scratch/
 
 # --- IDEs ---
 .vscode/
