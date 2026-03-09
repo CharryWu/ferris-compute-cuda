@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as SyncCommand;
 use tokio::fs;
+use tokio::process::Command as AsyncCommand;
 
 /// Dynamically locates the Microsoft Visual C++ (MSVC) x64 compiler toolchain.
 ///
@@ -103,6 +104,38 @@ pub async fn get_nvidia_status() -> Option<(String, u32, u32, u32, u32)> {
     } else {
         None
     }
+}
+
+/// Builds a fully configured `nvcc` compilation command.
+///
+/// Handles Windows-specific MSVC host compiler injection, the `-I.` include
+/// path for local headers, caller-supplied flags, and the `-rdc=true` flag
+/// required when linking more than one translation unit.
+/// The caller is responsible for setting `.current_dir()` and spawning.
+pub fn build_nvcc_command(
+    entry_point: &str,
+    flags: &[String],
+    is_multi_file: bool,
+    bin_name: &str,
+) -> AsyncCommand {
+    let mut cmd = AsyncCommand::new("nvcc");
+
+    // Inject MSVC host compiler path on Windows
+    if let Some(ccbin) = find_msvc_x64_bin() {
+        cmd.arg("-ccbin").arg(ccbin);
+    }
+
+    cmd.arg(entry_point)
+        .arg("-I.") // Ensure local headers are discoverable
+        .args(flags);
+
+    // Relocatable Device Code is required when linking across multiple translation units
+    if is_multi_file {
+        cmd.arg("-rdc=true");
+    }
+
+    cmd.arg("-o").arg(bin_name);
+    cmd
 }
 
 /// Reconstructs the uploaded files into the provided working directory

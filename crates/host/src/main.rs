@@ -1,5 +1,6 @@
 mod utils;
 
+use anyhow::Context;
 use clap::Parser;
 use common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer};
 use common::compute::{ComputeRequest, ComputeResponse};
@@ -47,6 +48,76 @@ fn u8_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).to_string()
 }
 
+/// Drives the full compile-and-run pipeline for a single job.
+///
+/// Using `?` for setup failures keeps each step flat and readable.
+/// Compile/execution results are reported through the stream rather than
+/// propagated as errors, so the caller only receives an `Err` for genuine
+/// internal failures (e.g. couldn't spawn nvcc).
+async fn run_job(
+    tx: &mpsc::Sender<Result<ComputeResponse, Status>>,
+    req: ComputeRequest,
+    working_dir: &Path,
+) -> anyhow::Result<()> {
+    // 1. Create temporary workspace and reconstruct the uploaded directory tree
+    fs::create_dir_all(working_dir)
+        .await
+        .context("Failed to create workspace")?;
+
+    // Platform-agnostic output binary name
+    let bin_name = if cfg!(windows) { "app.exe" } else { "app.out" };
+    let is_multi_file = req.files.len() > 1;
+
+    utils::prepare_workspace(working_dir, req.files)
+        .await
+        .context("Failed to prepare workspace")?;
+
+    // 2. Compile with NVCC
+    let compile_output = utils::build_nvcc_command(
+        &req.entry_point_file,
+        &req.compiler_flags,
+        is_multi_file,
+        bin_name,
+    )
+    .current_dir(working_dir)
+    .output()
+    .await
+    .context("Failed to spawn nvcc")?;
+
+    send_output(tx, u8_to_string(&compile_output.stdout), false).await;
+
+    if !compile_output.status.success() {
+        send_output(
+            tx,
+            format!(
+                "❌ Compilation failed. Full error:\n{}",
+                u8_to_string(&compile_output.stderr)
+            ),
+            true,
+        )
+        .await;
+        return Ok(());
+    }
+
+    send_output(tx, "🚀 Compilation successful. Running binary...".into(), false).await;
+
+    // 3. Execute the compiled binary with a hard timeout
+    let exec_future = AsyncCommand::new(working_dir.join(bin_name))
+        .current_dir(working_dir)
+        .output();
+
+    match timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS), exec_future).await {
+        Ok(Ok(exec_output)) => {
+            send_output(tx, u8_to_string(&exec_output.stdout), false).await;
+            send_output(tx, u8_to_string(&exec_output.stderr), true).await;
+        }
+        Ok(Err(e)) => send_output(tx, format!("❌ Execution failed: {}", e), true).await,
+        Err(_) => send_output(tx, "⏱️ Execution timed out. Process killed.".into(), true).await,
+    }
+
+    Ok(())
+}
+
 pub struct HostExecutor;
 
 #[tonic::async_trait]
@@ -81,88 +152,11 @@ impl CudaExecutor for HostExecutor {
             let job_id = uuid::Uuid::new_v4().to_string();
             let working_dir = Path::new("scratch").join(&job_id);
 
-            // 1. Create temporary workspace and reconstruct directory tree
-            if let Err(e) = fs::create_dir_all(&working_dir).await {
-                let _ = tx
-                    .send(Err(Status::internal(format!("Failed to create workspace: {}", e))))
-                    .await;
-                return;
+            if let Err(e) = run_job(&tx, req, &working_dir).await {
+                send_output(&tx, format!("❌ Internal error: {}", e), true).await;
             }
 
-            // Platform agnostic binary extension
-            let bin_name = if cfg!(windows) { "app.exe" } else { "app.out" };
-            let is_multi_file = req.files.len() > 1;
-
-            // Move the file reconstruction to utils to handle the map of files
-            if let Err(e) = utils::prepare_workspace(&working_dir, req.files).await {
-                // keep the gRPC stream alive even on setup errors
-                send_output(&tx, format!("❌ Failed to prepare workspace: {}", e), true).await;
-                let _ = fs::remove_dir_all(&working_dir).await;
-                return;
-            }
-
-            // 2. Compile with NVCC
-            let mut cmd = AsyncCommand::new("nvcc");
-
-            // Discovery of MSVC toolchain for Windows
-            if let Some(ccbin) = utils::find_msvc_x64_bin() {
-                cmd.arg("-ccbin").arg(ccbin);
-            }
-
-            // Setup base compilation arguments
-            cmd.arg(&req.entry_point_file)
-                .arg("-I.") // Ensure local headers are discoverable
-                .args(&req.compiler_flags);
-
-            // Automatically enable Relocatable Device Code for multi-file projects
-            if is_multi_file {
-                cmd.arg("-rdc=true");
-            }
-
-            let compile_result = cmd.arg("-o").arg(bin_name).current_dir(&working_dir).output().await;
-
-            match compile_result {
-                Ok(compile_output) => {
-                    let compiler_stdout = u8_to_string(&compile_output.stdout);
-                    let compiler_stderr = u8_to_string(&compile_output.stderr);
-
-                    send_output(&tx, compiler_stdout, false).await;
-
-                    if !compile_output.status.success() {
-                        send_output(
-                            &tx,
-                            format!("❌ Compilation failed. Full error:\n{}", compiler_stderr),
-                            true,
-                        )
-                        .await;
-                    } else {
-                        send_output(&tx, "🚀 Compilation successful. Running binary...".into(), false).await;
-
-                        let bin_path = working_dir.join(bin_name);
-
-                        // 3. Execute the binary
-                        let exec_future = AsyncCommand::new(bin_path).current_dir(&working_dir).output();
-
-                        match timeout(Duration::from_secs(EXECUTION_TIMEOUT_SECS), exec_future).await {
-                            Ok(Ok(exec_output)) => {
-                                send_output(&tx, u8_to_string(&exec_output.stdout), false).await;
-                                send_output(&tx, u8_to_string(&exec_output.stderr), true).await;
-                            }
-                            Ok(Err(e)) => {
-                                send_output(&tx, format!("❌ Execution failed: {}", e), true).await;
-                            }
-                            Err(_) => {
-                                send_output(&tx, "⏱️ Execution timed out. Process killed.".into(), true).await;
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    send_output(&tx, "❌ Compilation failed. Internal error occurred.".into(), true).await;
-                }
-            }
-
-            // 4. Cleanup
+            // Cleanup the working directory regardless of job outcome
             let _ = fs::remove_dir_all(&working_dir).await;
             println!("🧹 Cleaned up job {}", job_id);
         });
