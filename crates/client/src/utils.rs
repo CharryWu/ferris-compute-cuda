@@ -1,14 +1,15 @@
+use ignore::WalkBuilder;
 use std::collections::HashMap;
 use std::path::Path;
 
+const ALLOWED_EXTENSIONS: [&str; 6] = ["cu", "cuh", "ptx", "cubin", "h", "cpp"];
+
 /// Recursively gathers valid CUDA/C++ files from a path (file or directory)
 pub fn gather_files_recursive(
-    base_dir: &Path,     // The fixed "root" of the sync (e.g., "project/")
-    current_path: &Path, // The current file/folder being visited
-    files_map: &mut HashMap<String, String>,
+    base_dir: &Path,                         // The fixed "root" of the sync (e.g., "project/")
+    current_path: &Path,                     // The current file/folder being visited
+    files_map: &mut HashMap<String, String>, // File name -> Content pairs, initially empty map
 ) -> Result<(), Box<dyn std::error::Error>> {
-    const ALLOWED_EXTENSIONS: [&str; 6] = ["cu", "cuh", "ptx", "cubin", "h", "cpp"];
-
     if current_path.is_dir() {
         for entry in std::fs::read_dir(current_path)? {
             // Keep passing the original base_dir down so prefix stripping stays consistent

@@ -73,16 +73,11 @@ async fn run_job(
         .context("Failed to prepare workspace")?;
 
     // 2. Compile with NVCC
-    let compile_output = utils::build_nvcc_command(
-        &req.entry_point_file,
-        &req.compiler_flags,
-        is_multi_file,
-        bin_name,
-    )
-    .current_dir(working_dir)
-    .output()
-    .await
-    .context("Failed to spawn nvcc")?;
+    let compile_output = utils::build_nvcc_command(&req.entry_point_file, &req.compiler_flags, is_multi_file, bin_name)
+        .current_dir(working_dir)
+        .output()
+        .await
+        .context("Failed to spawn nvcc")?;
 
     send_output(tx, u8_to_string(&compile_output.stdout), false).await;
 
@@ -151,12 +146,13 @@ impl CudaExecutor for HostExecutor {
         tokio::spawn(async move {
             let job_id = uuid::Uuid::new_v4().to_string();
             let working_dir = Path::new("scratch").join(&job_id);
+            // POSTCOND: working_dir = scrach/437140f9-7eb3-457b-9c5e-2af2de1d4794
 
             if let Err(e) = run_job(&tx, req, &working_dir).await {
                 send_output(&tx, format!("❌ Internal error: {}", e), true).await;
             }
 
-            // Cleanup the working directory regardless of job outcome
+            // Guaranteed - Cleanup the working directory regardless of job outcome
             let _ = fs::remove_dir_all(&working_dir).await;
             println!("🧹 Cleaned up job {}", job_id);
         });

@@ -109,3 +109,4 @@ project/                   scratch/<UUID>/
 * **Token Authentication:** gRPC Interceptors reject unauthorized requests before spawning tasks.
 * **Isolation:** Every job runs in a unique UUID-based scratchpad; workspaces are purged immediately after execution.
 * **Compiler Streaming:** Full `nvcc` `stdout` and `stderr` are streamed back to the client for real-time debugging.
+* **Workspace Size:** Sync is limited to **50MB** to ensure fast transfers and host stability.

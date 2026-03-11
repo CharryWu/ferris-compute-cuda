@@ -7,6 +7,8 @@ use common::compute::cuda_executor_client::CudaExecutorClient;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+const MAX_WORKSPACE_SIZE_MB: usize = 50; // Max total size of files to send (in MB)
+
 #[derive(Parser, Debug)]
 #[command(name = "ferris-run", about = "Remote CUDA Execution Tool")]
 pub enum Args {
@@ -69,6 +71,7 @@ async fn handle_run(
         utils::gather_files_recursive(&global_base, &canon_path, &mut files)?;
     }
 
+    // 2. Pre-checks: Ensure we have at least one file and that total size is within limits
     if files.is_empty() {
         eprintln!(
             "{}",
@@ -77,7 +80,18 @@ async fn handle_run(
         std::process::exit(1);
     }
 
-    // 2. Identify Entry Point (the first path provided by the user)
+    let total_size_mb: usize = files.values().map(|content| content.len()).sum::<usize>() / (1024 * 1024);
+    if total_size_mb > MAX_WORKSPACE_SIZE_MB {
+        eprintln!(
+            "{} {} MB (limit: {} MB). Please reduce the number or size of files.",
+            "❌ Error: Total workspace size".red(),
+            total_size_mb,
+            MAX_WORKSPACE_SIZE_MB
+        );
+        std::process::exit(1);
+    }
+
+    // 3. Identify Entry Point (the first path provided by the user)
     let entry_file = entry_input
         .strip_prefix(&global_base)?
         .to_string_lossy()
