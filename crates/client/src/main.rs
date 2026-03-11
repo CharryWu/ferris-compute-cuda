@@ -61,14 +61,16 @@ async fn handle_run(
     } else {
         entry_input
             .parent()
-            .ok_or("Could not determine base directory")?
+            .ok_or("Invalid base: Could not determine base directory")?
             .to_path_buf()
     };
+
+    let ignore_list = utils::read_ignore(&global_base);
 
     // 2. Gather files using the fix Global Base
     for input in &inputs {
         let canon_path = input.canonicalize()?;
-        utils::gather_files_recursive(&global_base, &canon_path, &mut files)?;
+        utils::gather_files_recursive(&global_base, &canon_path, &mut files, &ignore_list)?;
     }
 
     // 2. Pre-checks: Ensure we have at least one file and that total size is within limits
