@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit hook: run client and host unit tests before allowing a commit.
+# Setup: git config core.hooksPath .githooks
+
+set -e
+
+echo "Running client tests..."
+cargo test -p client
+
+echo "Running host tests..."
+cargo test -p host
+
+echo "All tests passed."

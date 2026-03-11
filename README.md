@@ -83,6 +83,8 @@ cargo test -p host     # Host: auth, workspace prep, nvcc command building
 
 Tests live under [`crates/client/tests/`](./crates/client/tests/) and [`crates/host/tests/`](./crates/host/tests/).
 
+**Pre-commit hook:** Run `./scripts/setup-git-hooks.sh` once to run client and host tests automatically before each commit.
+
 Real example - multiple files:
 
 ```bash
