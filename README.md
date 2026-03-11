@@ -19,6 +19,7 @@ We maintain a historical record of all architectural pivots:
 * [0018-windows-path-execution-fix.md](./docs/changelog/0018-windows-path-execution-fix.md)
 * [0020-configuration-priority-and-dotenv.md](./docs/changelog/0020-configuration-priority-and-dotenv.md)
 * [0023-multi-file-workspace-and-telemetry.md](./docs/changelog/0023-multi-file-workspace-and-telemetry.md)
+* [0027-client-integration-tests.md](./docs/changelog/0027-client-integration-tests.md)
 
 ---
 
@@ -70,6 +71,16 @@ cargo run -p client -- run --server "http://<SERVER_IP>:50051" "<ENTRY_POINT_FIL
 ```
 
 *Note: The first path provided is treated as the primary entry point.*
+
+### 🧪 Run Tests
+
+Run unit and integration tests for the client crate:
+
+```bash
+cargo test -p client
+```
+
+Tests live under [`crates/client/tests/`](./crates/client/tests/) and cover CLI argument parsing, file gathering, ignore rules, and edge cases (e.g., empty inputs).
 
 Real example - multiple files:
 
