@@ -1,6 +1,12 @@
 use anyhow::Context; // Adds the .context() method to Results
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// Converts a byte slice to a UTF-8 string, replacing invalid sequences.
+pub fn u8_to_string(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).to_string()
+}
+
 use std::process::Command as SyncCommand;
 use tokio::fs;
 use tokio::process::Command as AsyncCommand;

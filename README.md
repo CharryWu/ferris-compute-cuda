@@ -74,13 +74,14 @@ cargo run -p client -- run --server "http://<SERVER_IP>:50051" "<ENTRY_POINT_FIL
 
 ### 🧪 Run Tests
 
-Run unit and integration tests for the client crate:
+Run unit and integration tests:
 
 ```bash
-cargo test -p client
+cargo test -p client   # Client: CLI parsing, file gathering, ignore rules
+cargo test -p host     # Host: auth, workspace prep, nvcc command building
 ```
 
-Tests live under [`crates/client/tests/`](./crates/client/tests/) and cover CLI argument parsing, file gathering, ignore rules, and edge cases (e.g., empty inputs).
+Tests live under [`crates/client/tests/`](./crates/client/tests/) and [`crates/host/tests/`](./crates/host/tests/).
 
 Real example - multiple files:
 
