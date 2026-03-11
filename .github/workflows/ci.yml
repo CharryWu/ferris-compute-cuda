@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            host: true
+          - runner: windows-latest
+            host: true
+          - runner: macos-latest
+            host: false
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build client
+        run: cargo build -p client
+
+      - name: Test client
+        run: cargo test -p client
+
+      - name: Build host
+        if: matrix.host
+        run: cargo build -p host
+
+      - name: Test host
+        if: matrix.host
+        run: cargo test -p host
