@@ -26,6 +26,9 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Build client
