@@ -95,6 +95,8 @@ cargo run -p client -- run --server "http://10.0.0.181:50051" ./samples/deep_pro
 
 ### 📂 Directory Structures
 
+> Run this command `cargo run -p client -- run --server "http://<HOST_IP>:<PORT>" ./project/main.cu ./project/include/utils.cuh` will sync local folder to remote workspace `/scratch/<UUID>/`
+
 When syncing a folder, **ferris-compute-cuda** maintains the internal hierarchy:
 
 ```text
@@ -103,6 +105,8 @@ project/                   scratch/<UUID>/
  ├── main.cu        --->    ├── main.cu
  └── include/               └── include/
       └── utils.cuh              └── utils.cuh
+
+```
 
 ---
 
