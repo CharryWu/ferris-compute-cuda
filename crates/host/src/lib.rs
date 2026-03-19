@@ -199,10 +199,16 @@ pub async fn run_server(args: HostArgs) -> Result<(), Box<dyn std::error::Error>
 
     fs::create_dir_all("scratch").await?;
 
-    match register_mdns(HOST_PORT) {
-        Ok(_mdns) => println!("📡 mDNS: Advertising as {} on port {}", MDNS_SERVICE_TYPE, HOST_PORT),
-        Err(e) => eprintln!("⚠️  mDNS registration failed (non-fatal): {}", e),
-    }
+    let _mdns_handle = match register_mdns(HOST_PORT) {
+        Ok(mdns) => {
+            println!("📡 mDNS: Advertising as {} on port {}", MDNS_SERVICE_TYPE, HOST_PORT);
+            Some(mdns)
+        }
+        Err(e) => {
+            eprintln!("⚠️  mDNS registration failed (non-fatal): {}", e);
+            None
+        }
+    };
 
     println!("🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)", addr);
 
