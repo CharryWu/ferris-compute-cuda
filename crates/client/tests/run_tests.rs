@@ -99,6 +99,12 @@ fn args_status_server_is_none_by_default() {
 }
 
 #[test]
+fn args_discover_parses() {
+    let args = Args::parse_from(["ferris-run", "discover"]);
+    assert!(matches!(args, Args::Discover));
+}
+
+#[test]
 fn resolve_server_cli_takes_priority() {
     let result = resolve_server(Some("http://explicit:50051".into()));
     assert_eq!(result, Some("http://explicit:50051".to_string()));

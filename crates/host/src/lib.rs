@@ -199,6 +199,7 @@ pub async fn run_server(args: HostArgs) -> Result<(), Box<dyn std::error::Error>
 
     fs::create_dir_all("scratch").await?;
 
+    // Must stay alive for the lifetime of the server; dropping shuts down mDNS advertisement.
     let _mdns_handle = match register_mdns(HOST_PORT) {
         Ok(mdns) => {
             println!("📡 mDNS: Advertising as {} on port {}", MDNS_SERVICE_TYPE, HOST_PORT);
