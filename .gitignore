@@ -66,6 +66,9 @@ tmpxft*
 *.pem
 *.key
 
+# User connection history (auto-generated)
+/.ferris-compute/history.json
+
 # Folders where the host builds user-submitted code
 /crates/host/scratch/
 /crates/host/build_artifacts/
