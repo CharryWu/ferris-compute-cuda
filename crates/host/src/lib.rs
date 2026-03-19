@@ -149,18 +149,31 @@ impl CudaExecutor for HostExecutor {
 const MDNS_SERVICE_TYPE: &str = "_ferris-compute._tcp.local.";
 const HOST_PORT: u16 = 50051;
 
+/// Normalizes an OS hostname into a valid mDNS hostname ending with `.local.`.
+/// Handles bare names (Windows: `DESKTOP-ABC`), already-qualified names
+/// (macOS: `MyMac.local`), and trailing dots.
+pub fn mdns_hostname(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('.');
+    if trimmed.ends_with(".local") {
+        format!("{}.", trimmed)
+    } else {
+        format!("{}.local.", trimmed)
+    }
+}
+
 fn register_mdns(port: u16) -> Result<ServiceDaemon, Box<dyn std::error::Error>> {
     let mdns = ServiceDaemon::new()?;
-    let hostname = hostname::get()
+    let raw_hostname = hostname::get()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let instance_name = format!("ferris-compute-{}", &hostname);
+    let instance_name = format!("ferris-compute-{}", &raw_hostname);
+    let host = mdns_hostname(&raw_hostname);
     let properties = [("version", env!("CARGO_PKG_VERSION"))];
     let service = ServiceInfo::new(
         MDNS_SERVICE_TYPE,
         &instance_name,
-        &format!("{}.", hostname),
+        &host,
         "",
         port,
         &properties[..],

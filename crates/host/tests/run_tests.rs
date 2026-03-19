@@ -1,5 +1,5 @@
 use clap::Parser;
-use host::{build_nvcc_command, check_auth, HostArgs};
+use host::{build_nvcc_command, check_auth, mdns_hostname, HostArgs};
 use tonic::Request;
 
 #[test]
@@ -73,4 +73,24 @@ fn build_nvcc_command_multi_file_injects_rdc() {
 
     assert!(args.contains(&"-rdc=true".to_string()));
     assert!(args.contains(&"-arch=sm_80".to_string()));
+}
+
+#[test]
+fn mdns_hostname_bare_windows_name() {
+    assert_eq!(mdns_hostname("DESKTOP-DBL75S2"), "DESKTOP-DBL75S2.local.");
+}
+
+#[test]
+fn mdns_hostname_macos_already_qualified() {
+    assert_eq!(mdns_hostname("MyMac.local"), "MyMac.local.");
+}
+
+#[test]
+fn mdns_hostname_with_trailing_dot() {
+    assert_eq!(mdns_hostname("MyMac.local."), "MyMac.local.");
+}
+
+#[test]
+fn mdns_hostname_bare_linux_name() {
+    assert_eq!(mdns_hostname("gpu-server"), "gpu-server.local.");
 }
