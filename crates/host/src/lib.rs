@@ -163,21 +163,13 @@ pub fn mdns_hostname(raw: &str) -> String {
 
 fn register_mdns(port: u16) -> Result<ServiceDaemon, Box<dyn std::error::Error>> {
     let mdns = ServiceDaemon::new()?;
-    let raw_hostname = hostname::get()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
+    let raw_hostname = hostname::get().unwrap_or_default().to_string_lossy().to_string();
     let instance_name = format!("ferris-compute-{}", &raw_hostname);
     let host = mdns_hostname(&raw_hostname);
     let properties = [("version", env!("CARGO_PKG_VERSION"))];
-    let service = ServiceInfo::new(
-        MDNS_SERVICE_TYPE,
-        &instance_name,
-        &host,
-        "",
-        port,
-        &properties[..],
-    )?;
+    // With empty IPs, mdns-sd only announces after enable_addr_auto() fills addresses.
+    let service =
+        ServiceInfo::new(MDNS_SERVICE_TYPE, &instance_name, &host, "", port, &properties[..])?.enable_addr_auto();
     mdns.register(service)?;
     Ok(mdns)
 }
@@ -214,9 +206,7 @@ pub async fn run_server(args: HostArgs) -> Result<(), Box<dyn std::error::Error>
     println!("🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)", addr);
 
     let token = args.token.clone();
-    let service = CudaExecutorServer::with_interceptor(executor, move |req| {
-        check_auth(req, &token)
-    });
+    let service = CudaExecutorServer::with_interceptor(executor, move |req| check_auth(req, &token));
     Server::builder().add_service(service).serve(addr).await?;
 
     Ok(())
