@@ -1,0 +1,34 @@
+---
+description: Rust patterns used in this workspace (client, host, common)
+globs: "**/*.rs"
+---
+
+# Rust conventions (this repo)
+
+## Structure
+
+- **`main.rs`** stays thin: parse CLI / load dotenv, delegate to the crate **`lib.rs`**.
+- **`lib.rs`** exposes the public API and `pub mod` submodules (`config`, `discovery`, `interactive`, `utils`, etc.).
+
+## Errors
+
+- Binaries often return `Result<(), Box<dyn std::error::Error>>`.
+- Host internals use **`anyhow`** (`Context`, `.context(...)`) where helpful.
+
+## Async
+
+- **`#[tokio::main]`** on binaries; **`async fn`** for gRPC service methods and I/O.
+- Use **`tokio::process::Command`** for spawning NVCC on the host.
+
+## Tests
+
+- Integration tests live under **`crates/{client,host}/tests/`** (not inline `#[cfg(test)]` only).
+- **`tempfile`** is used for filesystem fixtures where needed.
+
+## Formatting
+
+- **Edition 2024**; **`rustfmt.toml`**: `max_width = 120`.
+
+## Cross-platform
+
+- Host path / toolchain logic may use **`cfg!(windows)`** and friends; keep client portable (including macOS CI without NVCC).

@@ -1,0 +1,31 @@
+---
+description: Protobuf and gRPC (tonic) workflow for the common crate
+globs: "crates/common/**"
+---
+
+# gRPC / Protobuf (`crates/common`)
+
+## Source of truth
+
+- Single file: **`crates/common/proto/compute.proto`** — defines `CUDAExecutor` service and messages.
+
+## Codegen
+
+- **`crates/common/build.rs`** runs **`tonic-build`** (needs **`protoc`** at build time).
+- Generated code is included via **`tonic::include_proto!("compute")`** in **`crates/common/src/lib.rs`** under `pub mod compute { ... }`.
+
+## RPC shape
+
+- **`ExecuteCode`** — **server-streaming**: `ComputeRequest` → stream of `ComputeResponse` (log lines, `is_error` flag).
+- **`GetGpuStatus`** — unary: `Empty` → `GpuStatus`.
+
+## After editing `.proto`
+
+1. Run **`cargo build -p common`** to regenerate and catch compile errors.
+2. Update **client** call sites (`CudaExecutorClient`, streaming).
+3. Update **host** impl (`CudaExecutor` trait, `CudaExecutorServer`).
+
+## Imports (typical)
+
+- Client: `common::compute::cuda_executor_client::CudaExecutorClient`
+- Host: `common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer}`

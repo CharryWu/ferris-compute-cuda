@@ -1,0 +1,30 @@
+---
+description: ferris-compute-cuda workspace overview — crates, commands, conventions
+alwaysApply: true
+---
+
+# ferris-compute-cuda
+
+Personal **Rust + CUDA** learning project: remote CLI that sends CUDA sources to a **GPU host** over **gRPC**. Three workspace members:
+
+- **`crates/client`** — CLI (`run`, `status`, `discover`), file sync, config / interactive server selection
+- **`crates/host`** — GPU-side daemon, NVCC, auth interceptors, log streaming
+- **`crates/common`** — `compute.proto`, `tonic`/`prost` codegen in `build.rs`
+
+## Commands
+
+- Build: `cargo build -p client`, `cargo build -p host`
+- Test: `cargo test -p client`, `cargo test -p host`
+- Aliases: `cargo ferris-run`, `cargo ferris-status` (see `.cargo/config.toml`)
+
+**Requires `protoc` on PATH** for the `common` crate.
+
+## Conventions
+
+- Changelog decisions: `docs/changelog/NNNN-slug.md` (incrementing 4-digit prefix)
+- Architecture notes: `docs/architecture/`
+- Commits: conventional one-liner, e.g. `feat(client): …`, `fix(host): …`
+
+## Learning context
+
+The owner is **learning Rust**. When suggesting Rust changes, briefly explain non-obvious idioms (ownership, lifetimes, `async`, trait bounds, error handling) when they matter.
