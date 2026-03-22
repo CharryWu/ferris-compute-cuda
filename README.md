@@ -83,6 +83,22 @@ cargo run -p client -- status --server "http://<SERVER_IP>:50051"
 
 ```
 
+#### 🔍 Discover hosts on the LAN
+
+The `discover` subcommand scans the local network for hosts advertising the ferris-compute mDNS service (`_ferris-compute._tcp`). The scan runs for about **3 seconds**, then prints each host’s base URL and hostname. The GPU host must be running so it can advertise; discovery does not require a token.
+
+```bash
+# From the workspace:
+cargo run -p client -- discover
+
+# If the client binary is on your PATH (e.g. after `cargo install --path crates/client`):
+client discover
+```
+
+If nothing is found, ensure the host is up, both machines share a LAN (or loopback), and multicast/mDNS is not blocked by a firewall. On **Windows**, if mDNS does not resolve the local host, the client may still list **`http://127.0.0.1:50051`** when something is listening on the default port (see [0029-windows-local-discovery-fallback.md](./docs/changelog/0029-windows-local-discovery-fallback.md)).
+
+Discovered hosts also appear in the **interactive server prompt** when you run `run` or `status` without `--server`, env, or config (TTY only).
+
 #### 🏃 Run CUDA Code
 
 The client automatically detects if you are sending a single file or an entire project (multi-file support with directories).
