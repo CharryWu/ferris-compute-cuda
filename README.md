@@ -20,6 +20,7 @@ We maintain a historical record of all architectural pivots:
 * [0020-configuration-priority-and-dotenv.md](./docs/changelog/0020-configuration-priority-and-dotenv.md)
 * [0023-multi-file-workspace-and-telemetry.md](./docs/changelog/0023-multi-file-workspace-and-telemetry.md)
 * [0027-client-integration-tests.md](./docs/changelog/0027-client-integration-tests.md)
+* [0028-client-ux-improvements.md](./docs/changelog/0028-client-ux-improvements.md)
 
 ---
 
@@ -32,6 +33,7 @@ Create a `.env` file in the root directory (or use environment variables) on bot
 ```ini
 # .env
 FERRIS_AUTH_TOKEN=your-secure-token
+FERRIS_SERVER=http://<SERVER_IP>:50051
 
 ```
 
@@ -50,12 +52,52 @@ cargo run -p host -- --token "optional-override-token"
 
 The client supports subcommands for monitoring and execution.
 
+#### 🔧 Install the CLI (Optional)
+
+For a shorter command, install the binary globally:
+
+```bash
+cargo install --path crates/client
+# Now use `ferris-run` directly:
+ferris-run status
+ferris-run run ./samples/helloworld/matrix_addition.cu
+```
+
+Alternatively, use the built-in **cargo aliases** (no install required):
+
+```bash
+cargo ferris-status
+cargo ferris-run ./samples/helloworld/matrix_addition.cu
+```
+
+If `FERRIS_SERVER` is set in your `.env` or environment, you can omit `--server` entirely.
+
 #### 📊 Check GPU Status
 
 ```bash
+# With FERRIS_SERVER in .env (shortest form):
+cargo ferris-status
+
+# Or with explicit server:
 cargo run -p client -- status --server "http://<SERVER_IP>:50051"
 
 ```
+
+#### 🔍 Discover hosts on the LAN
+
+The `discover` subcommand scans the local network for hosts advertising the ferris-compute mDNS service (`_ferris-compute._tcp`). The scan runs for about **3 seconds**, then prints each host’s base URL and hostname. The GPU host must be running so it can advertise; discovery does not require a token.
+
+```bash
+# From the workspace:
+cargo run -p client -- discover
+
+# If the client binary is on your PATH (e.g. after `cargo install --path crates/client`):
+client discover
+```
+
+If nothing is found, ensure the host is up, both machines share a LAN (or loopback), and multicast/mDNS is not blocked by a firewall. On **Windows**, if mDNS does not resolve the local host, the client may still list **`http://127.0.0.1:50051`** when something is listening on the default port (see [0029-windows-local-discovery-fallback.md](./docs/changelog/0029-windows-local-discovery-fallback.md)).
+
+Discovered hosts also appear in the **interactive server prompt** when you run `run` or `status` without `--server`, env, or config (TTY only).
 
 #### 🏃 Run CUDA Code
 
@@ -63,7 +105,10 @@ The client automatically detects if you are sending a single file or an entire p
 You have to supply entry point file as first file argument to the `run` subcommand:
 
 ```bash
-# Single File
+# Single File (with FERRIS_SERVER in .env):
+cargo ferris-run ./samples/helloworld/matrix_addition.cu
+
+# Single File (explicit server):
 cargo run -p client -- run --server "http://<SERVER_IP>:50051" ./samples/helloworld/matrix_addition.cu
 
 # Multiple Files (supports .cu, .cuh, .cpp. .hpp, .h)
@@ -112,11 +157,12 @@ project/                   scratch/<UUID>/
 
 ## 🛠 Configuration Priority
 
-| Priority | Method | Example |
-| --- | --- | --- |
-| **1 (Highest)** | CLI Argument | `--token "xyz"` |
-| **2** | Shell Variable | `export FERRIS_AUTH_TOKEN="xyz"` |
-| **3** | `.env` File | `FERRIS_AUTH_TOKEN=xyz` |
+| Priority | Method | Token Example | Server Example |
+| --- | --- | --- | --- |
+| **1 (Highest)** | CLI Argument | `--token "xyz"` | `--server "http://..."` |
+| **2** | Shell Variable | `export FERRIS_AUTH_TOKEN="xyz"` | `export FERRIS_SERVER="http://..."` |
+| **3** | `.env` File | `FERRIS_AUTH_TOKEN=xyz` | `FERRIS_SERVER=http://...` |
+| **4 (Lowest)** | Config File | — | `~/.ferris-compute/config.toml` |
 
 ---
 

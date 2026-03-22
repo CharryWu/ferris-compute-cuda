@@ -9,6 +9,7 @@ use anyhow::Context;
 use clap::Parser;
 use common::compute::cuda_executor_server::{CudaExecutor, CudaExecutorServer};
 use common::compute::{ComputeRequest, ComputeResponse};
+use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::path::Path;
 use std::time::Duration;
 use tokio::fs;
@@ -145,6 +146,34 @@ impl CudaExecutor for HostExecutor {
     }
 }
 
+const MDNS_SERVICE_TYPE: &str = "_ferris-compute._tcp.local.";
+const HOST_PORT: u16 = 50051;
+
+/// Normalizes an OS hostname into a valid mDNS hostname ending with `.local.`.
+/// Handles bare names (Windows: `DESKTOP-ABC`), already-qualified names
+/// (macOS: `MyMac.local`), and trailing dots.
+pub fn mdns_hostname(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches('.');
+    if trimmed.ends_with(".local") {
+        format!("{}.", trimmed)
+    } else {
+        format!("{}.local.", trimmed)
+    }
+}
+
+fn register_mdns(port: u16) -> Result<ServiceDaemon, Box<dyn std::error::Error>> {
+    let mdns = ServiceDaemon::new()?;
+    let raw_hostname = hostname::get().unwrap_or_default().to_string_lossy().to_string();
+    let instance_name = format!("ferris-compute-{}", &raw_hostname);
+    let host = mdns_hostname(&raw_hostname);
+    let properties = [("version", env!("CARGO_PKG_VERSION"))];
+    // With empty IPs, mdns-sd only announces after enable_addr_auto() fills addresses.
+    let service =
+        ServiceInfo::new(MDNS_SERVICE_TYPE, &instance_name, &host, "", port, &properties[..])?.enable_addr_auto();
+    mdns.register(service)?;
+    Ok(mdns)
+}
+
 /// Starts the host server. Used by main; exposed for testing.
 pub async fn run_server(args: HostArgs) -> Result<(), Box<dyn std::error::Error>> {
     if cfg!(windows) {
@@ -157,17 +186,27 @@ pub async fn run_server(args: HostArgs) -> Result<(), Box<dyn std::error::Error>
         }
     }
 
-    let addr = "0.0.0.0:50051".parse()?;
+    let addr = format!("0.0.0.0:{}", HOST_PORT).parse()?;
     let executor = HostExecutor;
 
     fs::create_dir_all("scratch").await?;
 
+    // Must stay alive for the lifetime of the server; dropping shuts down mDNS advertisement.
+    let _mdns_handle = match register_mdns(HOST_PORT) {
+        Ok(mdns) => {
+            println!("📡 mDNS: Advertising as {} on port {}", MDNS_SERVICE_TYPE, HOST_PORT);
+            Some(mdns)
+        }
+        Err(e) => {
+            eprintln!("⚠️  mDNS registration failed (non-fatal): {}", e);
+            None
+        }
+    };
+
     println!("🦀 Ferris-Compute-Cuda Host listening on {} (Authenticated)", addr);
 
     let token = args.token.clone();
-    let service = CudaExecutorServer::with_interceptor(executor, move |req| {
-        check_auth(req, &token)
-    });
+    let service = CudaExecutorServer::with_interceptor(executor, move |req| check_auth(req, &token));
     Server::builder().add_service(service).serve(addr).await?;
 
     Ok(())

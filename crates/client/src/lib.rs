@@ -1,6 +1,9 @@
 //! Client library for remote CUDA execution.
-//! Exposes Args, handle_run, handle_status, and utils for testing.
+//! Exposes Args, handle_run, handle_status, config, and utils for testing.
 
+pub mod config;
+pub mod discovery;
+pub mod interactive;
 mod utils;
 
 pub use utils::{gather_files_recursive, read_ignore};
@@ -12,7 +15,7 @@ use common::compute::cuda_executor_client::CudaExecutorClient;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-const MAX_WORKSPACE_SIZE_MB: usize = 50; // Max total size of files to send (in MB)
+const MAX_WORKSPACE_SIZE_MB: usize = 50;
 
 #[derive(Parser, Debug)]
 #[command(name = "ferris-run", about = "Remote CUDA Execution Tool")]
@@ -24,8 +27,8 @@ pub enum Args {
         inputs: Vec<PathBuf>,
 
         /// Remote host address (e.g., http://192.168.1.50:50051)
-        #[arg(short, long, default_value = "http://[::1]:50051")]
-        server: String,
+        #[arg(short, long, env = "FERRIS_SERVER")]
+        server: Option<String>,
 
         /// Extra flags for nvcc (e.g., "-arch=sm_80")
         #[arg(short, long)]
@@ -38,18 +41,30 @@ pub enum Args {
     /// Check the status of the remote GPU
     Status {
         /// Remote host address (e.g., http://192.168.1.50:50051)
-        #[arg(short, long, default_value = "http://[::1]:50051")]
-        server: String,
+        #[arg(short, long, env = "FERRIS_SERVER")]
+        server: Option<String>,
 
         #[arg(short, long, env = "FERRIS_AUTH_TOKEN")]
         token: String,
     },
+
+    /// Discover ferris-compute hosts on the local network
+    Discover,
+}
+
+/// Resolves the server address using the priority chain:
+/// CLI arg > FERRIS_SERVER env > ~/.ferris-compute/config.toml > None
+pub fn resolve_server(cli_server: Option<String>) -> Option<String> {
+    if let Some(s) = cli_server {
+        return Some(s);
+    }
+    config::resolve_server_from_config()
 }
 
 /// Execute CUDA code on the remote host.
 pub async fn handle_run(
     inputs: Vec<PathBuf>,
-    server: String,
+    server: &str,
     flags: Vec<String>,
     token: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -117,7 +132,7 @@ pub async fn handle_run(
     println!("{} Connecting to host at {}...", "📡".bold(), server.cyan());
 
     // 4. Connect and Prepare Request
-    let mut client = CudaExecutorClient::connect(server.clone()).await?;
+    let mut client = CudaExecutorClient::connect(server.to_string()).await?;
     let files_len = files.len();
 
     // Note: The .proto was updated to use 'map<string, string> files' and 'string entry_point_file'
@@ -165,16 +180,17 @@ pub async fn handle_run(
         }
     }
 
+    config::save_history_entry(server);
     println!("\n{} Execution finished.", "✅".bold().green());
     Ok(())
 }
 
 /// Query GPU status from the remote host.
-pub async fn handle_status(server: String, token: String) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn handle_status(server: &str, token: String) -> Result<(), Box<dyn std::error::Error>> {
     println!("📡 Querying GPU status from {}...", server);
 
     // 1. Connect to the remote Host
-    let mut client = common::compute::cuda_executor_client::CudaExecutorClient::connect(server).await?;
+    let mut client = common::compute::cuda_executor_client::CudaExecutorClient::connect(server.to_string()).await?;
 
     // 2. Prepare the Request with an empty body
     let mut request = tonic::Request::new(common::compute::Empty {});
@@ -208,5 +224,6 @@ pub async fn handle_status(server: String, token: String) -> Result<(), Box<dyn 
         }
     }
 
+    config::save_history_entry(server);
     Ok(())
 }
