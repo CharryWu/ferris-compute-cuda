@@ -22,6 +22,11 @@ We maintain a historical record of all architectural pivots:
 * [0027-client-integration-tests.md](./docs/changelog/0027-client-integration-tests.md)
 * [0028-client-ux-improvements.md](./docs/changelog/0028-client-ux-improvements.md)
 
+## Architecture & roadmap
+
+* Design write-ups: [`docs/architecture/`](./docs/architecture/) (protocol, client CLI, host engine, CI, etc.).
+* **Future direction (not implemented):** [Migration: single host → distributed GPU cluster](./docs/architecture/migration-single-host-to-distributed-cluster.md) — central router, GPU-type routing, host heartbeats/telemetry, vertical scaling (many GPUs per machine).
+
 ---
 
 ## 🚀 Quick Start

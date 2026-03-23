@@ -42,6 +42,7 @@ cargo ferris-status          # same as: cargo run -p client -- status
 
 - Numbered decision logs: `docs/changelog/NNNN-slug.md`
 - Deeper design: `docs/architecture/` (client CLI, host engine, protocol, build script, CI notes)
+- **Distributed cluster roadmap** (not implemented yet): [`docs/architecture/migration-single-host-to-distributed-cluster.md`](docs/architecture/migration-single-host-to-distributed-cluster.md) — router, GPU-type routing, host heartbeats, vertical scaling
 
 ## Style
 
