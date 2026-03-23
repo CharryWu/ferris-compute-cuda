@@ -4,6 +4,10 @@ use std::fs::read_to_string;
 
 const ALLOWED_EXTENSIONS: [&str; 7] = ["cu", "cuh", "ptx", "cubin", "h", "cpp", "hpp"];
 
+fn is_match(pattern: &str, name: &str) -> bool {
+    pattern == name || pattern.ends_with("*") && name.starts_with(&pattern[..pattern.len() - 1])
+}
+
 /// Recursively gathers valid CUDA/C++ files from a path (file or directory)
 /// Respects the provided ignore_list for both folders and files.
 pub fn gather_files_recursive(
@@ -20,7 +24,7 @@ pub fn gather_files_recursive(
 
     // 2. Check against ignore list (exact match for names like "target" or ".git")
     // This handles both files and directories.
-    if ignore_list.iter().any(|pattern| name == pattern) {
+    if ignore_list.iter().any(|pattern| is_match(pattern, name)) {
         return Ok(()); // Early return if the current node is among ignore list
     }
 
@@ -79,4 +83,38 @@ pub fn read_ignore(base_dir: &Path) -> Vec<String> {
     }
 
     ignores
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_match;
+
+    #[test]
+    fn is_match_exact_name() {
+        assert!(is_match("target", "target"));
+        assert!(is_match(".git", ".git"));
+        assert!(!is_match("target", "targets"));
+        assert!(!is_match("target", "Target"));
+    }
+
+    #[test]
+    fn is_match_prefix_wildcard() {
+        assert!(is_match("build*", "build"));
+        assert!(is_match("build*", "build_output"));
+        assert!(is_match("*.log", "*.log")); // literal filename "*.log" in ignore file
+        assert!(!is_match("build*", "rebuild"));
+    }
+
+    #[test]
+    fn is_match_star_only_matches_anything() {
+        assert!(is_match("*", "anything"));
+        assert!(is_match("*", ""));
+    }
+
+    #[test]
+    fn is_match_star_not_at_end_is_exact_only() {
+        // Only trailing `*` triggers prefix semantics; otherwise full string equality.
+        assert!(is_match("pre*fix", "pre*fix"));
+        assert!(!is_match("pre*fix", "prefix"));
+    }
 }
